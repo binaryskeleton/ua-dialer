@@ -13,7 +13,11 @@ from pathlib import Path
 from typing import Any, Mapping
 from urllib.parse import urlparse
 
+from dotenv import load_dotenv
+
 TERMINAL_CALL_STATUSES = {"completed", "busy", "failed", "no-answer", "canceled"}
+
+load_dotenv(Path(__file__).with_name(".env"), override=True)
 
 
 @dataclass(frozen=True)
@@ -28,6 +32,7 @@ class Config:
     audio_url: str
     keyword: str
     openai_api_key: str
+    telegram_message: str
     poll_interval_seconds: int = 15
     poll_timeout_seconds: int = 1800
     recording_format: str = "mp3"
@@ -50,6 +55,7 @@ class Config:
             "audio_url": os.getenv("AUDIO_URL", ""),
             "keyword": os.getenv("KEYWORD", ""),
             "openai_api_key": os.getenv("OPENAI_API_KEY", ""),
+            "telegram_message": os.getenv("TELEGRAM_MESSAGE", "Its Pee 4 Cops day yay!!!!!"),
         }
         if overrides:
             values.update({name: value for name, value in overrides.items() if value is not None})
@@ -224,7 +230,7 @@ def run(config: Config, *, dry_run: bool = False) -> int:
         print("Keyword was found.")
         return 0
 
-    message = "Its Pee 4 Cops day yay!!!!!"
+    message = config.telegram_message
     message_id = send_telegram_message(config, message)
     print(message)
     print(f"Keyword was not found; Telegram message sent: {message_id}")

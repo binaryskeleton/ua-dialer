@@ -1,0 +1,134 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Communication Consent</title>
+  <style>
+    :root {
+      color-scheme: light;
+      font-family: Georgia, "Times New Roman", serif;
+      color: #1d2a2e;
+      background: #edf2ef;
+    }
+    body {
+      margin: 0;
+      padding: 2rem 1rem;
+    }
+    main {
+      max-width: 720px;
+      margin: 0 auto;
+      padding: 2rem;
+      background: #fff;
+      border: 1px solid #cbd8d2;
+      border-radius: 8px;
+      box-shadow: 0 12px 30px rgb(29 42 46 / 10%);
+    }
+    h1 { margin-top: 0; color: #164c4a; }
+    h2 { margin-top: 2rem; color: #286b64; font-size: 1.15rem; }
+    p, li { line-height: 1.6; }
+    .notice {
+      padding: 1rem;
+      border-left: 4px solid #d17b36;
+      background: #fff7ed;
+    }
+    form {
+      display: grid;
+      gap: 1rem;
+      margin-top: 1.5rem;
+      padding: 1.25rem;
+      background: #f3f8f5;
+      border: 1px solid #cbd8d2;
+      border-radius: 8px;
+    }
+    label { font-weight: 700; }
+    input[type="text"], input[type="tel"] {
+      box-sizing: border-box;
+      width: 100%;
+      margin-top: .35rem;
+      padding: .7rem;
+      border: 1px solid #8aa59d;
+      border-radius: 4px;
+      font: inherit;
+    }
+    .checkbox-label {
+      display: flex;
+      gap: .65rem;
+      align-items: flex-start;
+      font-weight: 400;
+    }
+    button {
+      width: fit-content;
+      padding: .75rem 1rem;
+      border: 0;
+      border-radius: 4px;
+      color: #fff;
+      background: #164c4a;
+      font: inherit;
+      font-weight: 700;
+      cursor: pointer;
+    }
+    .confirmation {
+      padding: 1rem;
+      color: #164c4a;
+      background: #e2f2e8;
+    }
+    a { color: #165f69; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Communication Consent</h1>
+
+    <p><strong>[Brand Name]</strong> requests your permission to contact you about <strong>[describe the specific purpose]</strong>.</p>
+
+    <h2>What you are agreeing to</h2>
+    <p>By selecting “I agree” or verbally saying “yes,” you consent to receive automated telephone calls from [Brand Name] at the phone number you provide. Calls may use prerecorded audio and may be recorded and transcribed to understand and process your response.</p>
+    <p>If you provide a Telegram chat ID or connect with our Telegram bot, you also consent to receive related informational notifications through Telegram. Telegram notifications are separate from SMS messages; this program does not send SMS unless you separately opt in to SMS.</p>
+
+    <h2>Important information</h2>
+    <ul>
+      <li>Consent is voluntary and is not required to purchase goods or services.</li>
+      <li>Message, data, or telephone charges may apply depending on your provider.</li>
+      <li>Call frequency will be limited to what is reasonably necessary for [describe purpose].</li>
+      <li>Your information will be handled according to our <a href="privacy.html">Privacy Policy</a>.</li>
+    </ul>
+
+    <h2>How to opt out</h2>
+    <p>You may withdraw consent at any time by saying “stop” during a call, sending “STOP” to the Telegram bot, or contacting <a href="mailto:[support-email]">[support email]</a>. After an opt-out request, [Brand Name] will stop future automated calls and related Telegram notifications, except for limited messages needed to confirm or administer the opt-out.</p>
+
+    <p class="notice"><strong>Before publishing:</strong> replace every bracketed placeholder with accurate business, purpose, support, privacy-policy, and frequency information. This page explains consent; a secure system must separately record the person, timestamp, phone number, consent version, and response.</p>
+
+    <h2>Give consent</h2>
+    <form id="consent-form">
+      <label>
+        Name
+        <input name="name" type="text" autocomplete="name" required>
+      </label>
+      <label>
+        Phone number
+        <input name="phone" type="tel" autocomplete="tel" required>
+      </label>
+      <label>
+        Telegram username or chat ID (optional)
+        <input name="telegram" type="text" autocomplete="off">
+      </label>
+      <label class="checkbox-label">
+        <input name="consent" type="checkbox" required>
+        <span>I have read and understood this page, and I agree to receive the automated calls and related Telegram notifications described above from [Brand Name].</span>
+      </label>
+      <button type="submit">I agree</button>
+      <div id="confirmation" class="confirmation" hidden role="status">Thank you. Your consent was recorded by this page only as a confirmation. Connect this form to a secure consent service before using it in production.</div>
+    </form>
+
+    <p class="notice"><strong>Before publishing:</strong> this demonstration form does not send or store submissions. Connect it to a secure backend or form provider that records the consent timestamp, contact details, consent wording/version, and response.</p>
+  </main>
+  <script>
+    document.getElementById("consent-form").addEventListener("submit", function (event) {
+      event.preventDefault();
+      document.getElementById("confirmation").hidden = false;
+      this.querySelector("button").disabled = true;
+    });
+  </script>
+</body>
+</html>
