@@ -1,4 +1,4 @@
-"""Place a recorded Twilio call and notify when a keyword is transcribed."""
+"""Place a recorded SignalWire call and notify when a keyword is transcribed."""
 
 from __future__ import annotations
 
@@ -6,12 +6,12 @@ import argparse
 import os
 import re
 import sys
-
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
 from urllib.parse import urlparse
+from xml.etree import ElementTree
 
 from dotenv import load_dotenv
 
@@ -22,19 +22,20 @@ load_dotenv(Path(__file__).with_name(".env"), override=True)
 
 @dataclass(frozen=True)
 class Config:
-    twilio_account_sid: str
-    twilio_auth_token: str
-    twilio_from_number: str
+    signalwire_project_id: str
+    signalwire_api_token: str
+    signalwire_space_url: str
+    signalwire_from_number: str
+    owner_number: str
     call_to_number: str
-    telegram_bot_token: str
-    telegram_chat_id: str
     dtmf_digits: str
     audio_url: str
     keyword: str
-    openai_api_key: str
-    telegram_message: str
+    whisper_model: str
+    sms_message: str
     poll_interval_seconds: int = 15
     poll_timeout_seconds: int = 1800
+    listen_duration_seconds: int = 60
     recording_format: str = "mp3"
 
     @classmethod
@@ -45,43 +46,66 @@ class Config:
         overrides: Mapping[str, str] | None = None,
     ) -> "Config":
         values = {
-            "twilio_account_sid": os.getenv("TWILIO_ACCOUNT_SID", ""),
-            "twilio_auth_token": os.getenv("TWILIO_AUTH_TOKEN", ""),
-            "twilio_from_number": os.getenv("TWILIO_FROM_NUMBER", ""),
+            "signalwire_project_id": os.getenv("SIGNALWIRE_PROJECT_ID", ""),
+            "signalwire_api_token": os.getenv("SIGNALWIRE_API_TOKEN", ""),
+            "signalwire_space_url": os.getenv("SIGNALWIRE_SPACE", ""),
+            "signalwire_from_number": os.getenv("SIGNALWIRE_FROM_NUMBER", ""),
+            "owner_number": os.getenv("OWNER_NUMBER", ""),
             "call_to_number": os.getenv("CALL_TO_NUMBER", ""),
-            "telegram_bot_token": os.getenv("TELEGRAM_BOT_TOKEN", ""),
-            "telegram_chat_id": os.getenv("TELEGRAM_CHAT_ID", ""),
             "dtmf_digits": os.getenv("DTMF_DIGITS", ""),
             "audio_url": os.getenv("AUDIO_URL", ""),
             "keyword": os.getenv("KEYWORD", ""),
-            "openai_api_key": os.getenv("OPENAI_API_KEY", ""),
-            "telegram_message": os.getenv("TELEGRAM_MESSAGE", "Its Pee 4 Cops day yay!!!!!"),
+            "whisper_model": os.getenv("WHISPER_MODEL", "base"),
+            "sms_message": os.getenv("SMS_MESSAGE", "Its Pee 4 Cops day yay!!!!!"),
         }
         if overrides:
             values.update({name: value for name, value in overrides.items() if value is not None})
-        required = [
-            "twilio_from_number",
-            "call_to_number",
-            "telegram_chat_id",
-            "dtmf_digits",
-            "audio_url",
-            "keyword",
-        ]
+        required = ["call_to_number", "dtmf_digits", "audio_url", "keyword"]
         if not dry_run:
-            required.extend(["twilio_account_sid", "twilio_auth_token", "openai_api_key", "telegram_bot_token"])
+            required.extend([
+                "signalwire_project_id",
+                "signalwire_api_token",
+                "signalwire_space_url",
+                "signalwire_from_number",
+                "owner_number",
+            ])
         missing = [name for name in required if not values[name]]
         if missing:
             raise ValueError(f"Missing required environment variables: {', '.join(missing)}")
 
         if not re.fullmatch(r"[0-9*#A-Da-dw]+", values["dtmf_digits"]):
             raise ValueError("DTMF_DIGITS may contain only digits, *, #, A-D, or w pauses")
-        parsed_url = urlparse(values["audio_url"])
-        if parsed_url.scheme != "https" or not parsed_url.netloc:
+        if values["owner_number"] and not re.fullmatch(r"\+[1-9]\d{1,14}", values["owner_number"]):
+            raise ValueError("OWNER_NUMBER must be a phone number in E.164 format, such as +15551234567")
+        if not values["sms_message"].strip() or len(values["sms_message"]) > 1600:
+            raise ValueError("SMS_MESSAGE must contain between 1 and 1600 characters")
+        audio_url = urlparse(values["audio_url"])
+        if audio_url.scheme != "https" or not audio_url.netloc:
             raise ValueError("AUDIO_URL must be a complete HTTPS URL")
+        if values["signalwire_space_url"]:
+            space_value = values["signalwire_space_url"].strip()
+            if "://" not in space_value:
+                space_value = f"https://{space_value}"
+            values["signalwire_space_url"] = space_value
+            space_url = urlparse(values["signalwire_space_url"])
+            if (
+                space_url.scheme != "https"
+                or not space_url.netloc
+                or space_url.path not in ("", "/")
+                or space_url.query
+                or space_url.fragment
+            ):
+                raise ValueError("SIGNALWIRE_SPACE must be a SignalWire Space hostname or HTTPS URL")
+            values["signalwire_space_url"] = values["signalwire_space_url"].rstrip("/")
+
+        listen_duration_seconds = _positive_int_from_env("LISTEN_DURATION_SECONDS", 60)
+        if listen_duration_seconds > 400:
+            raise ValueError("LISTEN_DURATION_SECONDS must not exceed 600")
         return cls(
             **values,
             poll_interval_seconds=_positive_int_from_env("POLL_INTERVAL_SECONDS", 15),
             poll_timeout_seconds=_positive_int_from_env("POLL_TIMEOUT_SECONDS", 1800),
+            listen_duration_seconds=listen_duration_seconds,
             recording_format=os.getenv("RECORDING_FORMAT", "mp3"),
         )
 
@@ -98,13 +122,14 @@ def _positive_int_from_env(name: str, default: int) -> int:
 
 
 def build_twiml(config: Config) -> str:
-    from twilio.twiml.voice_response import VoiceResponse
-
-    response = VoiceResponse()
-    response.play(digits=config.dtmf_digits)
-    response.play(config.audio_url)
-    response.say("The message has ended. Please continue speaking.")
-    return str(response)
+    response = ElementTree.Element("Response")
+    ElementTree.SubElement(response, "Play", {"digits": config.dtmf_digits})
+    audio = ElementTree.SubElement(response, "Play")
+    audio.text = config.audio_url
+    prompt = ElementTree.SubElement(response, "Say")
+    prompt.text = "The message has ended. Please continue speaking."
+    ElementTree.SubElement(response, "Pause", {"length": str(config.listen_duration_seconds)})
+    return ElementTree.tostring(response, encoding="unicode", xml_declaration=True)
 
 
 def keyword_found(transcript: str, keyword: str) -> bool:
@@ -112,100 +137,128 @@ def keyword_found(transcript: str, keyword: str) -> bool:
     return re.search(rf"(?<!\w){escaped_keyword}(?!\w)", transcript, flags=re.IGNORECASE) is not None
 
 
-def wait_for_call_completion(call: Any, *, timeout_seconds: int, interval_seconds: int) -> str:
+def signalwire_request(config: Config, method: str, resource: str, **kwargs: Any) -> dict[str, Any]:
+    import requests
+
+    api_url = (
+        f"{config.signalwire_space_url}/api/laml/2010-04-01/Accounts/"
+        f"{config.signalwire_project_id}/{resource}"
+    )
+    response = requests.request(
+        method,
+        api_url,
+        auth=(config.signalwire_project_id, config.signalwire_api_token),
+        timeout=30,
+        **kwargs,
+    )
+    response.raise_for_status()
+    return response.json()
+
+
+def wait_for_call_completion(
+    config: Config,
+    call_sid: str,
+    *,
+    timeout_seconds: int,
+    interval_seconds: int,
+) -> str:
     deadline = time.monotonic() + timeout_seconds
     while True:
-        call = call.fetch()
-        status = str(call.status).lower()
+        call = signalwire_request(config, "GET", f"Calls/{call_sid}.json")
+        status = str(call.get("status", "")).lower()
         if status in TERMINAL_CALL_STATUSES:
             return status
         if time.monotonic() >= deadline:
-            raise TimeoutError("Timed out waiting for the Twilio call to finish")
+            raise TimeoutError("Timed out waiting for the SignalWire call to finish")
         time.sleep(interval_seconds)
 
 
-def wait_for_recording(client: Any, call_sid: str, *, timeout_seconds: int, interval_seconds: int) -> Any:
+def wait_for_recording(
+    config: Config,
+    call_sid: str,
+    *,
+    timeout_seconds: int,
+    interval_seconds: int,
+) -> dict[str, Any]:
     deadline = time.monotonic() + timeout_seconds
     while True:
-        recordings = client.recordings.list(call_sid=call_sid, limit=1)
+        result = signalwire_request(
+            config,
+            "GET",
+            "Recordings.json",
+            params={"CallSid": call_sid, "PageSize": 1},
+        )
+        recordings = result.get("recordings", [])
         if recordings:
-            return recordings[0]
+            recording = recordings[0]
+            status = str(recording.get("status", "")).lower()
+            if status == "completed":
+                return recording
+            if status == "absent":
+                raise RuntimeError("SignalWire did not produce a call recording")
         if time.monotonic() >= deadline:
-            raise TimeoutError("Timed out waiting for the Twilio recording")
+            raise TimeoutError("Timed out waiting for the SignalWire recording")
         time.sleep(interval_seconds)
 
 
-def download_recording(recording: Any, config: Config, destination: Path) -> None:
+def download_recording(recording: Mapping[str, Any], config: Config, destination: Path) -> None:
     import requests
 
-    recording_uri = str(recording.uri)
-    recording_url = f"https://api.twilio.com{recording_uri.rsplit('.', 1)[0]}.{config.recording_format}"
+    recording_uri = str(recording["uri"])
+    recording_path = recording_uri.removesuffix(".json")
+    recording_url = f"{config.signalwire_space_url}{recording_path}.{config.recording_format}"
     response = requests.get(
         recording_url,
-        auth=(config.twilio_account_sid, config.twilio_auth_token),
+        auth=(config.signalwire_project_id, config.signalwire_api_token),
         timeout=60,
     )
     response.raise_for_status()
     destination.write_bytes(response.content)
 
 
-def send_telegram_message(config: Config, message: str) -> str:
-    import requests
+class WhisperTranscriber:
+    def __init__(self, model_size: str) -> None:
+        from faster_whisper import WhisperModel
 
-    response = requests.post(
-        f"https://api.telegram.org/bot{config.telegram_bot_token}/sendMessage",
-        json={"chat_id": config.telegram_chat_id, "text": message},
-        timeout=30,
-    )
-    response.raise_for_status()
-    result = response.json()
-    if not result.get("ok"):
-        raise RuntimeError(f"Telegram rejected the message: {result}")
-    return str(result["result"]["message_id"])
-
-
-class OpenAITranscriber:
-    def __init__(self, api_key: str) -> None:
-        from openai import OpenAI
-
-        self._client = OpenAI(api_key=api_key)
+        self._model = WhisperModel(model_size, device="cpu", compute_type="int8")
 
     def transcribe(self, audio_path: Path) -> str:
-        with audio_path.open("rb") as audio_file:
-            result = self._client.audio.transcriptions.create(
-                model="gpt-4o-mini-transcribe",
-                file=audio_file,
-            )
-        return str(result.text)
+        segments, _ = self._model.transcribe(str(audio_path), beam_size=5)
+        return " ".join(segment.text.strip() for segment in segments).strip()
 
 
 def run(config: Config, *, dry_run: bool = False) -> int:
     twiml = build_twiml(config)
     if dry_run:
-        print("Dry run: no call or Telegram message was sent.")
+        print("Dry run: no call or SMS was sent.")
         print(f"Call destination: {config.call_to_number}")
         print(f"DTMF digits: {config.dtmf_digits}")
         print(f"Audio URL: {config.audio_url}")
-        print(f"TwiML generated: {'yes' if bool(twiml) else 'no'}")
+        print(f"Listening window: {config.listen_duration_seconds} seconds")
+        print(f"Call flow generated: {'yes' if bool(twiml) else 'no'}")
         return 0
 
-    from twilio.rest import Client
-
-    client = Client(config.twilio_account_sid, config.twilio_auth_token)
-    call = client.calls.create(
-        to=config.call_to_number,
-        from_=config.twilio_from_number,
-        twiml=twiml,
-        record=True,
-        recording_channels="dual",
+    call = signalwire_request(
+        config,
+        "POST",
+        "Calls.json",
+        data={
+            "To": config.call_to_number,
+            "From": config.signalwire_from_number,
+            "Twiml": twiml,
+            "Record": "true",
+            "RecordingChannels": "mono",
+            "RecordingTrack": "inbound",
+        },
     )
-    call_sid = call.sid
+    call_sid = call.get("sid")
     if not call_sid:
-        raise RuntimeError("Twilio did not return a call SID")
-    print(f"Twilio call created: {call_sid}")
+        raise RuntimeError("SignalWire did not return a call SID")
+    print(f"SignalWire call created: {call_sid}")
 
     call_status = wait_for_call_completion(
-        call,
+        config,
+        call_sid,
         timeout_seconds=config.poll_timeout_seconds,
         interval_seconds=config.poll_interval_seconds,
     )
@@ -214,7 +267,7 @@ def run(config: Config, *, dry_run: bool = False) -> int:
         return 1
 
     recording = wait_for_recording(
-        client,
+        config,
         call_sid,
         timeout_seconds=config.poll_timeout_seconds,
         interval_seconds=config.poll_interval_seconds,
@@ -222,7 +275,7 @@ def run(config: Config, *, dry_run: bool = False) -> int:
     recording_path = Path(f"recording.{config.recording_format}")
     try:
         download_recording(recording, config, recording_path)
-        transcript = OpenAITranscriber(config.openai_api_key).transcribe(recording_path)
+        transcript = WhisperTranscriber(config.whisper_model).transcribe(recording_path)
     finally:
         recording_path.unlink(missing_ok=True)
 
@@ -230,10 +283,20 @@ def run(config: Config, *, dry_run: bool = False) -> int:
         print("Keyword was found.")
         return 0
 
-    message = config.telegram_message
-    message_id = send_telegram_message(config, message)
-    print(message)
-    print(f"Keyword was not found; Telegram message sent: {message_id}")
+    sms = signalwire_request(
+        config,
+        "POST",
+        "Messages.json",
+        data={
+            "To": config.owner_number,
+            "From": config.signalwire_from_number,
+            "Body": config.sms_message,
+        },
+    )
+    sms_sid = sms.get("sid")
+    if not sms_sid:
+        raise RuntimeError("SignalWire did not return an SMS message SID")
+    print(f"SMS sent to owner number: {sms_sid}")
     return 0
 
 
@@ -242,10 +305,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="Validate configuration and generate TwiML without making a call",
+        help="Validate configuration and generate the call flow without making a call",
     )
     parser.add_argument("--call-to-number", help="Override CALL_TO_NUMBER for this run")
-    parser.add_argument("--telegram-chat-id", help="Override TELEGRAM_CHAT_ID for this run")
     parser.add_argument("--dtmf-digits", help="Override DTMF_DIGITS for this run")
     parser.add_argument("--keyword", help="Override KEYWORD for this run")
     return parser.parse_args()
@@ -256,7 +318,7 @@ def main() -> int:
     try:
         overrides = {
             name: getattr(args, name)
-            for name in ("call_to_number", "telegram_chat_id", "dtmf_digits", "keyword")
+            for name in ("call_to_number", "dtmf_digits", "keyword")
         }
         config = Config.from_environment(dry_run=args.dry_run, overrides=overrides)
         return run(config, dry_run=args.dry_run)

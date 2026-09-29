@@ -35,13 +35,12 @@ function Read-RequiredSecret {
 }
 
 $values = @{
-    TWILIO_ACCOUNT_SID = Read-RequiredSecret "TWILIO_ACCOUNT_SID"
-    TWILIO_AUTH_TOKEN = Read-RequiredSecret "TWILIO_AUTH_TOKEN"
-    OPENAI_API_KEY = Read-RequiredSecret "OPENAI_API_KEY"
-    TWILIO_FROM_NUMBER = Read-RequiredValue "TWILIO_FROM_NUMBER"
+    SIGNALWIRE_PROJECT_ID = Read-RequiredValue "SIGNALWIRE_PROJECT_ID"
+    SIGNALWIRE_API_TOKEN = Read-RequiredSecret "SIGNALWIRE_API_TOKEN"
+    SIGNALWIRE_SPACE = Read-RequiredValue "SIGNALWIRE_SPACE"
+    SIGNALWIRE_FROM_NUMBER = Read-RequiredValue "SIGNALWIRE_FROM_NUMBER"
+    OWNER_NUMBER = Read-RequiredValue "OWNER_NUMBER"
     CALL_TO_NUMBER = Read-RequiredValue "CALL_TO_NUMBER"
-    TELEGRAM_BOT_TOKEN = Read-RequiredSecret "TELEGRAM_BOT_TOKEN"
-    TELEGRAM_CHAT_ID = Read-RequiredValue "TELEGRAM_CHAT_ID"
     DTMF_DIGITS = Read-RequiredValue "DTMF_DIGITS"
     AUDIO_URL = Read-RequiredValue "AUDIO_URL"
     KEYWORD = Read-RequiredValue "KEYWORD"

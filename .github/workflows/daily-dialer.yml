@@ -1,0 +1,54 @@
+name: Daily dialer
+
+on:
+  schedule:
+    - cron: "0 11 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: daily-dialer
+  cancel-in-progress: false
+
+jobs:
+  dial:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      SIGNALWIRE_PROJECT_ID: ${{ secrets.SIGNALWIRE_PROJECT_ID }}
+      SIGNALWIRE_API_TOKEN: ${{ secrets.SIGNALWIRE_API_TOKEN }}
+      SIGNALWIRE_SPACE: ${{ vars.SIGNALWIRE_SPACE }}
+      SIGNALWIRE_FROM_NUMBER: ${{ secrets.SIGNALWIRE_FROM_NUMBER }}
+      OWNER_NUMBER: ${{ secrets.OWNER_NUMBER }}
+      CALL_TO_NUMBER: ${{ secrets.CALL_TO_NUMBER }}
+      DTMF_DIGITS: ${{ secrets.DTMF_DIGITS }}
+      AUDIO_URL: ${{ secrets.AUDIO_URL }}
+      KEYWORD: ${{ secrets.KEYWORD }}
+      WHISPER_MODEL: ${{ vars.WHISPER_MODEL || 'base' }}
+      LISTEN_DURATION_SECONDS: ${{ vars.LISTEN_DURATION_SECONDS || '60' }}
+      SMS_MESSAGE: ${{ vars.SMS_MESSAGE || 'Its Pee 4 Cops day yay!!!!!' }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Cache Whisper model
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/huggingface/hub
+          key: whisper-${{ runner.os }}-${{ vars.WHISPER_MODEL || 'base' }}
+
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt
+
+      - name: Place call and process response
+        run: python dialer.py
