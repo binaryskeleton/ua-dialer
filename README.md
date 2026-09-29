@@ -9,8 +9,9 @@ The complete project lives in this folder. Run all commands from here.
 3. Set `OWNER_NUMBER` to the owner's SMS destination in E.164 format.
 4. Copy `.env.example` to `.env` and fill in the credentials and call settings. The dialer loads `.env` automatically.
 5. Run `python dialer.py --dry-run` to validate the local settings without placing a call.
+6. Run `python dialer.py --sms-test` to test SignalWire SMS by itself. This sends one real SMS to `OWNER_NUMBER` and does not place a call.
 
-The call sends the configured DTMF tones, plays `AUDIO_URL`, prompts the called person to speak, then keeps the call open for `LISTEN_DURATION_SECONDS` (default 60). SignalWire records the caller's audio track; local Whisper transcribes the recording and the dialer checks for `KEYWORD`. Set `WHISPER_MODEL` to a model such as `base` (default) or `small`; the model is downloaded on first use and transcription runs on your computer without an OpenAI API key. If the keyword is absent, the dialer sends `SMS_MESSAGE` to `OWNER_NUMBER` using the SignalWire caller ID. `SMS_MESSAGE` defaults to `Its Pee 4 Cops day yay!!!!!` if omitted.
+The call sends the configured DTMF tones, plays `AUDIO_URL`, prompts the called person to speak, then keeps the call open for `LISTEN_DURATION_SECONDS` (default 60). SignalWire records the caller's audio track; local Whisper transcribes the recording and the dialer checks for `KEYWORD`. Set `WHISPER_MODEL` to a model such as `base` (default) or `small`; the model is downloaded on first use and transcription runs on your computer without an OpenAI API key. If the keyword is absent, the dialer sends `SMS_MESSAGE` to `OWNER_NUMBER` using SignalWire's Platform Messaging API. For Platform Free Trial, the `From` must be the trial-assigned SignalWire number and `OWNER_NUMBER` must be the one verified trial mobile number; trial SMS is limited to that destination. `SMS_MESSAGE` defaults to `Its Pee 4 Cops day yay!!!!!` if omitted.
 
 Keep `.env` private. It contains API keys and is excluded from Git. Install dependencies with `python -m pip install -r requirements.txt` if needed. SignalWire call charges and account restrictions may apply.
 

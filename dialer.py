@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import re
 import sys
@@ -43,6 +44,7 @@ class Config:
         cls,
         *,
         dry_run: bool = False,
+        sms_test: bool = False,
         overrides: Mapping[str, str] | None = None,
     ) -> "Config":
         values = {
@@ -60,8 +62,16 @@ class Config:
         }
         if overrides:
             values.update({name: value for name, value in overrides.items() if value is not None})
-        required = ["call_to_number", "dtmf_digits", "audio_url", "keyword"]
-        if not dry_run:
+        required = [] if sms_test else ["call_to_number", "dtmf_digits", "audio_url", "keyword"]
+        if not dry_run and not sms_test:
+            required.extend([
+                "signalwire_project_id",
+                "signalwire_api_token",
+                "signalwire_space_url",
+                "signalwire_from_number",
+                "owner_number",
+            ])
+        elif sms_test:
             required.extend([
                 "signalwire_project_id",
                 "signalwire_api_token",
@@ -151,8 +161,56 @@ def signalwire_request(config: Config, method: str, resource: str, **kwargs: Any
         timeout=30,
         **kwargs,
     )
-    response.raise_for_status()
+    if not response.ok:
+        try:
+            error_detail = json.dumps(response.json(), ensure_ascii=True)
+        except ValueError:
+            error_detail = response.text.strip()
+        if not error_detail:
+            error_detail = response.reason
+        raise RuntimeError(
+            f"SignalWire {method} {resource} failed with HTTP "
+            f"{response.status_code}: {error_detail[:1500]}"
+        )
     return response.json()
+
+
+def signalwire_messaging_request(config: Config, payload: Mapping[str, str]) -> dict[str, Any]:
+    import requests
+
+    response = requests.post(
+        f"{config.signalwire_space_url}/api/messaging/messages",
+        auth=(config.signalwire_project_id, config.signalwire_api_token),
+        json=dict(payload),
+        timeout=30,
+    )
+    if not response.ok:
+        try:
+            error_detail = json.dumps(response.json(), ensure_ascii=True)
+        except ValueError:
+            error_detail = response.text.strip()
+        if not error_detail:
+            error_detail = response.reason
+        raise RuntimeError(
+            f"SignalWire SMS failed with HTTP {response.status_code}: "
+            f"{error_detail[:1500]}"
+        )
+    return response.json()
+
+
+def send_owner_sms(config: Config, message: str) -> str:
+    result = signalwire_messaging_request(
+        config,
+        {
+            "to": config.owner_number,
+            "from": config.signalwire_from_number,
+            "body": message,
+        },
+    )
+    message_id = result.get("id")
+    if not message_id:
+        raise RuntimeError("SignalWire did not return a message ID")
+    return message_id
 
 
 def wait_for_call_completion(
@@ -227,7 +285,12 @@ class WhisperTranscriber:
         return " ".join(segment.text.strip() for segment in segments).strip()
 
 
-def run(config: Config, *, dry_run: bool = False) -> int:
+def run(config: Config, *, dry_run: bool = False, sms_test: bool = False) -> int:
+    if sms_test:
+        sms_sid = send_owner_sms(config, "UA Dialer SMS test")
+        print(f"SMS test sent to owner number: {sms_sid}")
+        return 0
+
     twiml = build_twiml(config)
     if dry_run:
         print("Dry run: no call or SMS was sent.")
@@ -283,29 +346,23 @@ def run(config: Config, *, dry_run: bool = False) -> int:
         print("Keyword was found.")
         return 0
 
-    sms = signalwire_request(
-        config,
-        "POST",
-        "Messages.json",
-        data={
-            "To": config.owner_number,
-            "From": config.signalwire_from_number,
-            "Body": config.sms_message,
-        },
-    )
-    sms_sid = sms.get("sid")
-    if not sms_sid:
-        raise RuntimeError("SignalWire did not return an SMS message SID")
+    sms_sid = send_owner_sms(config, config.sms_message)
     print(f"SMS sent to owner number: {sms_sid}")
     return 0
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
+    run_mode = parser.add_mutually_exclusive_group()
+    run_mode.add_argument(
         "--dry-run",
         action="store_true",
         help="Validate configuration and generate the call flow without making a call",
+    )
+    run_mode.add_argument(
+        "--sms-test",
+        action="store_true",
+        help="Send one test SMS to OWNER_NUMBER without placing a phone call",
     )
     parser.add_argument("--call-to-number", help="Override CALL_TO_NUMBER for this run")
     parser.add_argument("--dtmf-digits", help="Override DTMF_DIGITS for this run")
@@ -320,8 +377,12 @@ def main() -> int:
             name: getattr(args, name)
             for name in ("call_to_number", "dtmf_digits", "keyword")
         }
-        config = Config.from_environment(dry_run=args.dry_run, overrides=overrides)
-        return run(config, dry_run=args.dry_run)
+        config = Config.from_environment(
+            dry_run=args.dry_run or args.sms_test,
+            sms_test=args.sms_test,
+            overrides=overrides,
+        )
+        return run(config, dry_run=args.dry_run, sms_test=args.sms_test)
     except Exception as exc:
         print(f"Dialer failed: {exc}", file=sys.stderr)
         return 1
