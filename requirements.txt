@@ -2,3 +2,4 @@ python-dotenv
 requests
 faster-whisper
 PyNaCl
+av<19
