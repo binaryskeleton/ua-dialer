@@ -1,5 +1,7 @@
+import io
 import os
 import unittest
+from contextlib import redirect_stdout
 from types import SimpleNamespace
 from unittest.mock import Mock, call, patch
 
@@ -60,6 +62,21 @@ class ProfileTests(unittest.TestCase):
             clear=True,
         ):
             config = Config.from_environment(dry_run=True)
+
+        self.assertEqual(config.profiles, ())
+
+    def test_transcription_test_does_not_require_discord_settings(self) -> None:
+        environment = {
+            "SIGNALWIRE_PROJECT_ID": "project",
+            "SIGNALWIRE_API_TOKEN": "api-token",
+            "SIGNALWIRE_SPACE": "space.signalwire.com",
+            "SIGNALWIRE_FROM_NUMBER": "+15551230000",
+            "CALL_TO_NUMBER": "+15551230002",
+            "DTMF_DIGITS": "1234",
+        }
+
+        with patch.dict(os.environ, environment, clear=True):
+            config = Config.from_environment(transcription_test=True)
 
         self.assertEqual(config.profiles, ())
 
@@ -143,6 +160,38 @@ class RoutingTests(unittest.TestCase):
                 call(config, "12345678901234568", "Today's color(s) you follow: blue."),
             ],
         )
+
+    def test_transcription_test_prints_full_transcript_without_sending_dms(self) -> None:
+        config = Config(
+            signalwire_project_id="project",
+            signalwire_api_token="token",
+            signalwire_space_url="space.signalwire.com",
+            signalwire_from_number="+15551230000",
+            discord_bot_token="",
+            call_to_number="+15551230002",
+            dtmf_digits="1234",
+            whisper_model="base",
+            profiles=(),
+            recording_format="test",
+        )
+        output = io.StringIO()
+
+        with (
+            patch("dialer.signalwire_request", return_value={"sid": "call-id"}),
+            patch("dialer.wait_for_call_completion", return_value="completed"),
+            patch("dialer.wait_for_recording", return_value={"uri": "/recording.json"}),
+            patch("dialer.download_recording"),
+            patch("dialer.WhisperTranscriber") as transcriber,
+            patch("dialer.send_discord_dm") as send_dm,
+            redirect_stdout(output),
+        ):
+            transcriber.return_value.transcribe.return_value = "The complete recognized speech."
+
+            result = run(config, transcription_test=True)
+
+        self.assertEqual(result, 0)
+        self.assertIn("The complete recognized speech.", output.getvalue())
+        send_dm.assert_not_called()
 
 
 if __name__ == "__main__":

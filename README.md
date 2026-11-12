@@ -11,6 +11,7 @@ The complete project lives in this folder. Run all commands from here.
 5. Copy `.env.example` to `.env` and fill in the credentials and call settings. The dialer loads `.env` automatically.
 6. Run `python dialer.py --dry-run` to validate the local call settings without placing a call.
 7. Run `python dialer.py --discord-test` to DM every configured recipient. This sends real messages and does not place a call.
+8. Run `python dialer.py --transcription-test` to place a real call and print the complete transcript in the local terminal without sending Discord DMs. This requires SignalWire settings but not Discord settings. Avoid running this mode in GitHub Actions because the transcript would be visible in workflow logs.
 
 The workflow calls `CALL_TO_NUMBER`, sends the configured DTMF tones, and listens to the answering party for `LISTEN_DURATION_SECONDS` (default 60). SignalWire records the caller's audio track; local Whisper transcribes the recording. The dialer checks the transcript for every color in the recipient profiles, then sends each recipient one Discord DM listing the colors they follow that were detected. Set `WHISPER_MODEL` to a model such as `base` (default) or `small`; the model is downloaded on first use and transcription runs on the GitHub runner without an OpenAI API key.
 

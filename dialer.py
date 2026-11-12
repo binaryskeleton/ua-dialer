@@ -50,6 +50,7 @@ class Config:
         *,
         dry_run: bool = False,
         discord_test: bool = False,
+        transcription_test: bool = False,
         overrides: Mapping[str, str] | None = None,
     ) -> "Config":
         values = {
@@ -65,18 +66,21 @@ class Config:
         profiles_json = os.getenv("DIALER_PROFILES_JSON", "")
         if overrides:
             values.update({name: value for name, value in overrides.items() if value is not None})
-        required = [] if discord_test else ["call_to_number", "dtmf_digits"]
-        if not dry_run:
+        if discord_test:
+            required = ["discord_bot_token"]
+        else:
+            required = ["call_to_number", "dtmf_digits"]
+        if not dry_run and not discord_test:
+            required.extend([
+                "signalwire_project_id",
+                "signalwire_api_token",
+                "signalwire_space_url",
+                "signalwire_from_number",
+            ])
+        if not dry_run and not discord_test and not transcription_test:
             required.append("discord_bot_token")
-            if not discord_test:
-                required.extend([
-                    "signalwire_project_id",
-                    "signalwire_api_token",
-                    "signalwire_space_url",
-                    "signalwire_from_number",
-                ])
         missing = [name for name in required if not values[name]]
-        if (discord_test or not dry_run) and not profiles_json:
+        if (discord_test or (not dry_run and not transcription_test)) and not profiles_json:
             missing.append("DIALER_PROFILES_JSON")
         if missing:
             raise ValueError(f"Missing required environment variables: {', '.join(missing)}")
@@ -100,7 +104,7 @@ class Config:
             values["signalwire_space_url"] = values["signalwire_space_url"].rstrip("/")
 
         profiles = parse_profiles(profiles_json) if profiles_json else ()
-        if (discord_test or not dry_run) and not profiles:
+        if (discord_test or (not dry_run and not transcription_test)) and not profiles:
             raise ValueError("DIALER_PROFILES_JSON must contain at least one recipient profile")
 
         listen_duration_seconds = _positive_int_from_env("LISTEN_DURATION_SECONDS", 60)
@@ -347,7 +351,13 @@ class WhisperTranscriber:
         return " ".join(segment.text.strip() for segment in segments).strip()
 
 
-def run(config: Config, *, dry_run: bool = False, discord_test: bool = False) -> int:
+def run(
+    config: Config,
+    *,
+    dry_run: bool = False,
+    discord_test: bool = False,
+    transcription_test: bool = False,
+) -> int:
     if discord_test:
         for profile in config.profiles:
             message_id = send_discord_dm(
@@ -408,6 +418,11 @@ def run(config: Config, *, dry_run: bool = False, discord_test: bool = False) ->
     finally:
         recording_path.unlink(missing_ok=True)
 
+    if transcription_test:
+        print("Full transcript:")
+        print(transcript if transcript else "(No speech was transcribed.)")
+        return 0
+
     notification_count = 0
     for profile in config.profiles:
         matched_colors = find_detected_colors(transcript, profile.colors)
@@ -438,6 +453,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Send a test DM to every configured user without placing a call",
     )
+    run_mode.add_argument(
+        "--transcription-test",
+        action="store_true",
+        help="Place a real call and print its full transcript without sending DMs",
+    )
     parser.add_argument("--call-to-number", help="Override CALL_TO_NUMBER for this run")
     parser.add_argument("--dtmf-digits", help="Override DTMF_DIGITS for this run")
     return parser.parse_args()
@@ -453,9 +473,15 @@ def main() -> int:
         config = Config.from_environment(
             dry_run=args.dry_run,
             discord_test=args.discord_test,
+            transcription_test=args.transcription_test,
             overrides=overrides,
         )
-        return run(config, dry_run=args.dry_run, discord_test=args.discord_test)
+        return run(
+            config,
+            dry_run=args.dry_run,
+            discord_test=args.discord_test,
+            transcription_test=args.transcription_test,
+        )
     except Exception as exc:
         print(f"Dialer failed: {exc}", file=sys.stderr)
         return 1
