@@ -39,11 +39,9 @@ $values = @{
     SIGNALWIRE_API_TOKEN = Read-RequiredSecret "SIGNALWIRE_API_TOKEN"
     SIGNALWIRE_SPACE = Read-RequiredValue "SIGNALWIRE_SPACE"
     SIGNALWIRE_FROM_NUMBER = Read-RequiredValue "SIGNALWIRE_FROM_NUMBER"
-    OWNER_NUMBER = Read-RequiredValue "OWNER_NUMBER"
+    DISCORD_WEBHOOK_URL = Read-RequiredSecret "DISCORD_WEBHOOK_URL"
     CALL_TO_NUMBER = Read-RequiredValue "CALL_TO_NUMBER"
     DTMF_DIGITS = Read-RequiredValue "DTMF_DIGITS"
-    AUDIO_URL = Read-RequiredValue "AUDIO_URL"
-    KEYWORD = Read-RequiredValue "KEYWORD"
 }
 
 foreach ($entry in $values.GetEnumerator()) {

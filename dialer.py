@@ -1,4 +1,4 @@
-"""Place a recorded SignalWire call and notify when a keyword is transcribed."""
+"""Place a recorded SignalWire call and notify a Discord channel when a keyword is transcribed."""
 
 from __future__ import annotations
 
@@ -17,6 +17,7 @@ from xml.etree import ElementTree
 from dotenv import load_dotenv
 
 TERMINAL_CALL_STATUSES = {"completed", "busy", "failed", "no-answer", "canceled"}
+KEYWORD = "yellow"
 
 load_dotenv(Path(__file__).with_name(".env"), override=True)
 
@@ -27,13 +28,11 @@ class Config:
     signalwire_api_token: str
     signalwire_space_url: str
     signalwire_from_number: str
-    owner_number: str
+    discord_webhook_url: str
     call_to_number: str
     dtmf_digits: str
-    audio_url: str
-    keyword: str
     whisper_model: str
-    sms_message: str
+    discord_message: str
     poll_interval_seconds: int = 15
     poll_timeout_seconds: int = 1800
     listen_duration_seconds: int = 60
@@ -44,7 +43,7 @@ class Config:
         cls,
         *,
         dry_run: bool = False,
-        sms_test: bool = False,
+        discord_test: bool = False,
         overrides: Mapping[str, str] | None = None,
     ) -> "Config":
         values = {
@@ -52,46 +51,41 @@ class Config:
             "signalwire_api_token": os.getenv("SIGNALWIRE_API_TOKEN", ""),
             "signalwire_space_url": os.getenv("SIGNALWIRE_SPACE", ""),
             "signalwire_from_number": os.getenv("SIGNALWIRE_FROM_NUMBER", ""),
-            "owner_number": os.getenv("OWNER_NUMBER", ""),
+            "discord_webhook_url": os.getenv("DISCORD_WEBHOOK_URL", ""),
             "call_to_number": os.getenv("CALL_TO_NUMBER", ""),
             "dtmf_digits": os.getenv("DTMF_DIGITS", ""),
-            "audio_url": os.getenv("AUDIO_URL", ""),
-            "keyword": os.getenv("KEYWORD", ""),
             "whisper_model": os.getenv("WHISPER_MODEL", "base"),
-            "sms_message": os.getenv("SMS_MESSAGE", "Its Pee 4 Cops day yay!!!!!"),
+            "discord_message": os.getenv("DISCORD_MESSAGE", "The word yellow was spoken."),
         }
         if overrides:
             values.update({name: value for name, value in overrides.items() if value is not None})
-        required = [] if sms_test else ["call_to_number", "dtmf_digits", "audio_url", "keyword"]
-        if not dry_run and not sms_test:
+        required = ["discord_webhook_url"] if discord_test else ["call_to_number", "dtmf_digits"]
+        if not dry_run and not discord_test:
             required.extend([
                 "signalwire_project_id",
                 "signalwire_api_token",
                 "signalwire_space_url",
                 "signalwire_from_number",
-                "owner_number",
-            ])
-        elif sms_test:
-            required.extend([
-                "signalwire_project_id",
-                "signalwire_api_token",
-                "signalwire_space_url",
-                "signalwire_from_number",
-                "owner_number",
+                "discord_webhook_url",
             ])
         missing = [name for name in required if not values[name]]
         if missing:
             raise ValueError(f"Missing required environment variables: {', '.join(missing)}")
 
-        if not re.fullmatch(r"[0-9*#A-Da-dw]+", values["dtmf_digits"]):
+        if values["dtmf_digits"] and not re.fullmatch(r"[0-9*#A-Da-dw]+", values["dtmf_digits"]):
             raise ValueError("DTMF_DIGITS may contain only digits, *, #, A-D, or w pauses")
-        if values["owner_number"] and not re.fullmatch(r"\+[1-9]\d{1,14}", values["owner_number"]):
-            raise ValueError("OWNER_NUMBER must be a phone number in E.164 format, such as +15551234567")
-        if not values["sms_message"].strip() or len(values["sms_message"]) > 1600:
-            raise ValueError("SMS_MESSAGE must contain between 1 and 1600 characters")
-        audio_url = urlparse(values["audio_url"])
-        if audio_url.scheme != "https" or not audio_url.netloc:
-            raise ValueError("AUDIO_URL must be a complete HTTPS URL")
+        if values["discord_webhook_url"]:
+            webhook_url = urlparse(values["discord_webhook_url"])
+            if (
+                webhook_url.scheme != "https"
+                or webhook_url.netloc not in {"discord.com", "discordapp.com"}
+                or not re.fullmatch(r"/api/webhooks/\d+/[^/]+/?", webhook_url.path)
+                or webhook_url.query
+                or webhook_url.fragment
+            ):
+                raise ValueError("DISCORD_WEBHOOK_URL must be a Discord webhook HTTPS URL")
+        if not values["discord_message"].strip() or len(values["discord_message"]) > 2000:
+            raise ValueError("DISCORD_MESSAGE must contain between 1 and 2000 characters")
         if values["signalwire_space_url"]:
             space_value = values["signalwire_space_url"].strip()
             if "://" not in space_value:
@@ -134,16 +128,12 @@ def _positive_int_from_env(name: str, default: int) -> int:
 def build_twiml(config: Config) -> str:
     response = ElementTree.Element("Response")
     ElementTree.SubElement(response, "Play", {"digits": config.dtmf_digits})
-    audio = ElementTree.SubElement(response, "Play")
-    audio.text = config.audio_url
-    prompt = ElementTree.SubElement(response, "Say")
-    prompt.text = "The message has ended. Please continue speaking."
     ElementTree.SubElement(response, "Pause", {"length": str(config.listen_duration_seconds)})
     return ElementTree.tostring(response, encoding="unicode", xml_declaration=True)
 
 
-def keyword_found(transcript: str, keyword: str) -> bool:
-    escaped_keyword = re.escape(keyword.strip())
+def keyword_found(transcript: str) -> bool:
+    escaped_keyword = re.escape(KEYWORD)
     return re.search(rf"(?<!\w){escaped_keyword}(?!\w)", transcript, flags=re.IGNORECASE) is not None
 
 
@@ -175,15 +165,17 @@ def signalwire_request(config: Config, method: str, resource: str, **kwargs: Any
     return response.json()
 
 
-def signalwire_messaging_request(config: Config, payload: Mapping[str, str]) -> dict[str, Any]:
+def send_discord_message(config: Config, message: str) -> str:
     import requests
 
-    response = requests.post(
-        f"{config.signalwire_space_url}/api/messaging/messages",
-        auth=(config.signalwire_project_id, config.signalwire_api_token),
-        json=dict(payload),
-        timeout=30,
-    )
+    try:
+        response = requests.post(
+            f"{config.discord_webhook_url}?wait=true",
+            json={"content": message},
+            timeout=30,
+        )
+    except requests.RequestException as exc:
+        raise RuntimeError("Discord webhook request failed") from exc
     if not response.ok:
         try:
             error_detail = json.dumps(response.json(), ensure_ascii=True)
@@ -192,25 +184,14 @@ def signalwire_messaging_request(config: Config, payload: Mapping[str, str]) -> 
         if not error_detail:
             error_detail = response.reason
         raise RuntimeError(
-            f"SignalWire SMS failed with HTTP {response.status_code}: "
+            f"Discord webhook failed with HTTP {response.status_code}: "
             f"{error_detail[:1500]}"
         )
-    return response.json()
-
-
-def send_owner_sms(config: Config, message: str) -> str:
-    result = signalwire_messaging_request(
-        config,
-        {
-            "to": config.owner_number,
-            "from": config.signalwire_from_number,
-            "body": message,
-        },
-    )
+    result = response.json()
     message_id = result.get("id")
     if not message_id:
-        raise RuntimeError("SignalWire did not return a message ID")
-    return message_id
+        raise RuntimeError("Discord did not return a message ID")
+    return str(message_id)
 
 
 def wait_for_call_completion(
@@ -285,18 +266,17 @@ class WhisperTranscriber:
         return " ".join(segment.text.strip() for segment in segments).strip()
 
 
-def run(config: Config, *, dry_run: bool = False, sms_test: bool = False) -> int:
-    if sms_test:
-        sms_sid = send_owner_sms(config, "UA Dialer SMS test")
-        print(f"SMS test sent to owner number: {sms_sid}")
+def run(config: Config, *, dry_run: bool = False, discord_test: bool = False) -> int:
+    if discord_test:
+        message_id = send_discord_message(config, "UA Dialer Discord bot test")
+        print(f"Discord test message sent: {message_id}")
         return 0
 
     twiml = build_twiml(config)
     if dry_run:
-        print("Dry run: no call or SMS was sent.")
+        print("Dry run: no call or Discord message was sent.")
         print(f"Call destination: {config.call_to_number}")
         print(f"DTMF digits: {config.dtmf_digits}")
-        print(f"Audio URL: {config.audio_url}")
         print(f"Listening window: {config.listen_duration_seconds} seconds")
         print(f"Call flow generated: {'yes' if bool(twiml) else 'no'}")
         return 0
@@ -342,12 +322,12 @@ def run(config: Config, *, dry_run: bool = False, sms_test: bool = False) -> int
     finally:
         recording_path.unlink(missing_ok=True)
 
-    if keyword_found(transcript, config.keyword):
-        print("Keyword was found.")
+    if keyword_found(transcript):
+        message_id = send_discord_message(config, config.discord_message)
+        print(f"Keyword detected; Discord bot notification sent: {message_id}")
         return 0
 
-    sms_sid = send_owner_sms(config, config.sms_message)
-    print(f"SMS sent to owner number: {sms_sid}")
+    print("Keyword was not detected; no Discord message was sent.")
     return 0
 
 
@@ -360,13 +340,12 @@ def parse_args() -> argparse.Namespace:
         help="Validate configuration and generate the call flow without making a call",
     )
     run_mode.add_argument(
-        "--sms-test",
+        "--discord-test",
         action="store_true",
-        help="Send one test SMS to OWNER_NUMBER without placing a phone call",
+        help="Send one test message to the configured Discord webhook without placing a call",
     )
     parser.add_argument("--call-to-number", help="Override CALL_TO_NUMBER for this run")
     parser.add_argument("--dtmf-digits", help="Override DTMF_DIGITS for this run")
-    parser.add_argument("--keyword", help="Override KEYWORD for this run")
     return parser.parse_args()
 
 
@@ -375,14 +354,14 @@ def main() -> int:
     try:
         overrides = {
             name: getattr(args, name)
-            for name in ("call_to_number", "dtmf_digits", "keyword")
+            for name in ("call_to_number", "dtmf_digits")
         }
         config = Config.from_environment(
-            dry_run=args.dry_run or args.sms_test,
-            sms_test=args.sms_test,
+            dry_run=args.dry_run,
+            discord_test=args.discord_test,
             overrides=overrides,
         )
-        return run(config, dry_run=args.dry_run, sms_test=args.sms_test)
+        return run(config, dry_run=args.dry_run, discord_test=args.discord_test)
     except Exception as exc:
         print(f"Dialer failed: {exc}", file=sys.stderr)
         return 1

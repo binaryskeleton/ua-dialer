@@ -2,6 +2,7 @@ name: Daily dialer
 
 on:
   schedule:
+    - cron: "0 10 * * *"
     - cron: "0 11 * * *"
   workflow_dispatch:
 
@@ -21,20 +22,31 @@ jobs:
       SIGNALWIRE_API_TOKEN: ${{ secrets.SIGNALWIRE_API_TOKEN }}
       SIGNALWIRE_SPACE: ${{ vars.SIGNALWIRE_SPACE || secrets.SIGNALWIRE_SPACE }}
       SIGNALWIRE_FROM_NUMBER: ${{ secrets.SIGNALWIRE_FROM_NUMBER }}
-      OWNER_NUMBER: ${{ secrets.OWNER_NUMBER }}
+      DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
       CALL_TO_NUMBER: ${{ secrets.CALL_TO_NUMBER }}
       DTMF_DIGITS: ${{ secrets.DTMF_DIGITS }}
-      AUDIO_URL: ${{ secrets.AUDIO_URL }}
-      KEYWORD: ${{ secrets.KEYWORD }}
       WHISPER_MODEL: ${{ vars.WHISPER_MODEL || 'base' }}
       LISTEN_DURATION_SECONDS: ${{ vars.LISTEN_DURATION_SECONDS || '60' }}
-      SMS_MESSAGE: ${{ vars.SMS_MESSAGE || 'Its Pee 4 Cops day yay!!!!!' }}
+      DISCORD_MESSAGE: ${{ vars.DISCORD_MESSAGE || 'The word yellow was spoken.' }}
 
     steps:
+      - name: Gate scheduled run to 4 a.m. Mountain Time
+        id: schedule_gate
+        shell: bash
+        run: |
+          if [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" ]] || [[ "$(TZ=America/Denver date +%H)" == "04" ]]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "This UTC trigger is not 4 a.m. Mountain Time; skipping."
+          fi
+
       - name: Check out repository
+        if: steps.schedule_gate.outputs.run == 'true'
         uses: actions/checkout@v7
 
       - name: Set up Python
+        if: steps.schedule_gate.outputs.run == 'true'
         uses: actions/setup-python@v7
         with:
           python-version: "3.12"
@@ -42,13 +54,16 @@ jobs:
           cache-dependency-path: requirements.txt
 
       - name: Cache Whisper model
+        if: steps.schedule_gate.outputs.run == 'true'
         uses: actions/cache@v6
         with:
           path: ~/.cache/huggingface/hub
           key: whisper-${{ runner.os }}-${{ vars.WHISPER_MODEL || 'base' }}
 
       - name: Install dependencies
+        if: steps.schedule_gate.outputs.run == 'true'
         run: python -m pip install -r requirements.txt
 
       - name: Place call and process response
+        if: steps.schedule_gate.outputs.run == 'true'
         run: python dialer.py
