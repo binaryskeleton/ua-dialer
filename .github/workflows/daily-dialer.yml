@@ -22,12 +22,12 @@ jobs:
       SIGNALWIRE_API_TOKEN: ${{ secrets.SIGNALWIRE_API_TOKEN }}
       SIGNALWIRE_SPACE: ${{ vars.SIGNALWIRE_SPACE || secrets.SIGNALWIRE_SPACE }}
       SIGNALWIRE_FROM_NUMBER: ${{ secrets.SIGNALWIRE_FROM_NUMBER }}
-      DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+      DISCORD_BOT_TOKEN: ${{ secrets.DISCORD_BOT_TOKEN }}
+      DIALER_PROFILES_JSON: ${{ secrets.DIALER_PROFILES_JSON }}
       CALL_TO_NUMBER: ${{ secrets.CALL_TO_NUMBER }}
       DTMF_DIGITS: ${{ secrets.DTMF_DIGITS }}
       WHISPER_MODEL: ${{ vars.WHISPER_MODEL || 'base' }}
       LISTEN_DURATION_SECONDS: ${{ vars.LISTEN_DURATION_SECONDS || '60' }}
-      DISCORD_MESSAGE: ${{ vars.DISCORD_MESSAGE || 'The word yellow was spoken.' }}
 
     steps:
       - name: Gate scheduled run to 4 a.m. Mountain Time

@@ -1,4 +1,4 @@
-"""Place a recorded SignalWire call and notify a Discord channel when a keyword is transcribed."""
+"""Place a recorded SignalWire call and DM users whose colors are transcribed."""
 
 from __future__ import annotations
 
@@ -17,9 +17,15 @@ from xml.etree import ElementTree
 from dotenv import load_dotenv
 
 TERMINAL_CALL_STATUSES = {"completed", "busy", "failed", "no-answer", "canceled"}
-KEYWORD = "yellow"
 
 load_dotenv(Path(__file__).with_name(".env"), override=True)
+
+
+@dataclass(frozen=True)
+class RecipientProfile:
+    name: str
+    discord_user_id: str
+    colors: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -28,11 +34,11 @@ class Config:
     signalwire_api_token: str
     signalwire_space_url: str
     signalwire_from_number: str
-    discord_webhook_url: str
+    discord_bot_token: str
     call_to_number: str
     dtmf_digits: str
     whisper_model: str
-    discord_message: str
+    profiles: tuple[RecipientProfile, ...]
     poll_interval_seconds: int = 15
     poll_timeout_seconds: int = 1800
     listen_duration_seconds: int = 60
@@ -51,41 +57,32 @@ class Config:
             "signalwire_api_token": os.getenv("SIGNALWIRE_API_TOKEN", ""),
             "signalwire_space_url": os.getenv("SIGNALWIRE_SPACE", ""),
             "signalwire_from_number": os.getenv("SIGNALWIRE_FROM_NUMBER", ""),
-            "discord_webhook_url": os.getenv("DISCORD_WEBHOOK_URL", ""),
+            "discord_bot_token": os.getenv("DISCORD_BOT_TOKEN", ""),
             "call_to_number": os.getenv("CALL_TO_NUMBER", ""),
             "dtmf_digits": os.getenv("DTMF_DIGITS", ""),
             "whisper_model": os.getenv("WHISPER_MODEL", "base"),
-            "discord_message": os.getenv("DISCORD_MESSAGE", "The word yellow was spoken."),
         }
+        profiles_json = os.getenv("DIALER_PROFILES_JSON", "")
         if overrides:
             values.update({name: value for name, value in overrides.items() if value is not None})
-        required = ["discord_webhook_url"] if discord_test else ["call_to_number", "dtmf_digits"]
-        if not dry_run and not discord_test:
-            required.extend([
-                "signalwire_project_id",
-                "signalwire_api_token",
-                "signalwire_space_url",
-                "signalwire_from_number",
-                "discord_webhook_url",
-            ])
+        required = [] if discord_test else ["call_to_number", "dtmf_digits"]
+        if not dry_run:
+            required.append("discord_bot_token")
+            if not discord_test:
+                required.extend([
+                    "signalwire_project_id",
+                    "signalwire_api_token",
+                    "signalwire_space_url",
+                    "signalwire_from_number",
+                ])
         missing = [name for name in required if not values[name]]
+        if (discord_test or not dry_run) and not profiles_json:
+            missing.append("DIALER_PROFILES_JSON")
         if missing:
             raise ValueError(f"Missing required environment variables: {', '.join(missing)}")
 
         if values["dtmf_digits"] and not re.fullmatch(r"[0-9*#A-Da-dw]+", values["dtmf_digits"]):
             raise ValueError("DTMF_DIGITS may contain only digits, *, #, A-D, or w pauses")
-        if values["discord_webhook_url"]:
-            webhook_url = urlparse(values["discord_webhook_url"])
-            if (
-                webhook_url.scheme != "https"
-                or webhook_url.netloc not in {"discord.com", "discordapp.com"}
-                or not re.fullmatch(r"/api/webhooks/\d+/[^/]+/?", webhook_url.path)
-                or webhook_url.query
-                or webhook_url.fragment
-            ):
-                raise ValueError("DISCORD_WEBHOOK_URL must be a Discord webhook HTTPS URL")
-        if not values["discord_message"].strip() or len(values["discord_message"]) > 2000:
-            raise ValueError("DISCORD_MESSAGE must contain between 1 and 2000 characters")
         if values["signalwire_space_url"]:
             space_value = values["signalwire_space_url"].strip()
             if "://" not in space_value:
@@ -102,16 +99,71 @@ class Config:
                 raise ValueError("SIGNALWIRE_SPACE must be a SignalWire Space hostname or HTTPS URL")
             values["signalwire_space_url"] = values["signalwire_space_url"].rstrip("/")
 
+        profiles = parse_profiles(profiles_json) if profiles_json else ()
+        if (discord_test or not dry_run) and not profiles:
+            raise ValueError("DIALER_PROFILES_JSON must contain at least one recipient profile")
+
         listen_duration_seconds = _positive_int_from_env("LISTEN_DURATION_SECONDS", 60)
         if listen_duration_seconds > 400:
             raise ValueError("LISTEN_DURATION_SECONDS must not exceed 600")
         return cls(
             **values,
+            profiles=profiles,
             poll_interval_seconds=_positive_int_from_env("POLL_INTERVAL_SECONDS", 15),
             poll_timeout_seconds=_positive_int_from_env("POLL_TIMEOUT_SECONDS", 1800),
             listen_duration_seconds=listen_duration_seconds,
             recording_format=os.getenv("RECORDING_FORMAT", "mp3"),
         )
+
+
+def parse_profiles(profiles_json: str) -> tuple[RecipientProfile, ...]:
+    try:
+        raw_profiles = json.loads(profiles_json)
+    except json.JSONDecodeError as exc:
+        raise ValueError("DIALER_PROFILES_JSON must be valid JSON") from exc
+    if not isinstance(raw_profiles, list):
+        raise ValueError("DIALER_PROFILES_JSON must be a JSON array")
+
+    profiles: list[RecipientProfile] = []
+    seen_user_ids: set[str] = set()
+    for index, raw_profile in enumerate(raw_profiles, start=1):
+        if not isinstance(raw_profile, dict):
+            raise ValueError(f"Profile {index} must be a JSON object")
+        name = raw_profile.get("name")
+        user_id = raw_profile.get("discord_user_id")
+        colors = raw_profile.get("colors")
+        if not isinstance(name, str) or not name.strip() or len(name.strip()) > 80:
+            raise ValueError(f"Profile {index} must have a name of 1 to 80 characters")
+        if not isinstance(user_id, str) or not re.fullmatch(r"\d{17,20}", user_id):
+            raise ValueError(f"Profile {index} must have a valid Discord user ID")
+        if user_id in seen_user_ids:
+            raise ValueError(f"Discord user ID appears in more than one profile: {user_id}")
+        if not isinstance(colors, list) or not colors:
+            raise ValueError(f"Profile {index} must have at least one color")
+
+        normalized_colors: list[str] = []
+        seen_colors: set[str] = set()
+        for color in colors:
+            if not isinstance(color, str):
+                raise ValueError(f"Every color in profile {index} must be a string")
+            normalized = " ".join(color.split())
+            if not normalized or len(normalized) > 60:
+                raise ValueError(f"Colors in profile {index} must contain 1 to 60 characters")
+            color_key = normalized.casefold()
+            if color_key not in seen_colors:
+                normalized_colors.append(normalized)
+                seen_colors.add(color_key)
+
+        profiles.append(
+            RecipientProfile(
+                name=name.strip(),
+                discord_user_id=user_id,
+                colors=tuple(normalized_colors),
+            )
+        )
+        seen_user_ids.add(user_id)
+
+    return tuple(profiles)
 
 
 def _positive_int_from_env(name: str, default: int) -> int:
@@ -132,9 +184,13 @@ def build_twiml(config: Config) -> str:
     return ElementTree.tostring(response, encoding="unicode", xml_declaration=True)
 
 
-def keyword_found(transcript: str) -> bool:
-    escaped_keyword = re.escape(KEYWORD)
-    return re.search(rf"(?<!\w){escaped_keyword}(?!\w)", transcript, flags=re.IGNORECASE) is not None
+def find_detected_colors(transcript: str, colors: tuple[str, ...]) -> tuple[str, ...]:
+    detected: list[str] = []
+    for color in colors:
+        color_pattern = r"\s+".join(re.escape(part) for part in color.split())
+        if re.search(rf"(?<!\w){color_pattern}(?!\w)", transcript, flags=re.IGNORECASE):
+            detected.append(color)
+    return tuple(detected)
 
 
 def signalwire_request(config: Config, method: str, resource: str, **kwargs: Any) -> dict[str, Any]:
@@ -165,17 +221,18 @@ def signalwire_request(config: Config, method: str, resource: str, **kwargs: Any
     return response.json()
 
 
-def send_discord_message(config: Config, message: str) -> str:
+def _discord_post(config: Config, url: str, payload: Mapping[str, str], operation: str) -> dict[str, Any]:
     import requests
 
     try:
         response = requests.post(
-            f"{config.discord_webhook_url}?wait=true",
-            json={"content": message},
+            url,
+            headers={"Authorization": f"Bot {config.discord_bot_token}"},
+            json=payload,
             timeout=30,
         )
     except requests.RequestException as exc:
-        raise RuntimeError("Discord webhook request failed") from exc
+        raise RuntimeError(f"Discord {operation} request failed") from exc
     if not response.ok:
         try:
             error_detail = json.dumps(response.json(), ensure_ascii=True)
@@ -184,10 +241,34 @@ def send_discord_message(config: Config, message: str) -> str:
         if not error_detail:
             error_detail = response.reason
         raise RuntimeError(
-            f"Discord webhook failed with HTTP {response.status_code}: "
+            f"Discord {operation} failed with HTTP {response.status_code}: "
             f"{error_detail[:1500]}"
         )
-    result = response.json()
+    try:
+        result = response.json()
+    except ValueError as exc:
+        raise RuntimeError(f"Discord {operation} returned invalid JSON") from exc
+    if not isinstance(result, dict):
+        raise RuntimeError(f"Discord {operation} returned an invalid response")
+    return result
+
+
+def send_discord_dm(config: Config, user_id: str, message: str) -> str:
+    channel = _discord_post(
+        config,
+        "https://discord.com/api/v10/users/@me/channels",
+        {"recipient_id": user_id},
+        "DM channel creation",
+    )
+    channel_id = channel.get("id")
+    if not channel_id:
+        raise RuntimeError("Discord did not return a DM channel ID")
+    result = _discord_post(
+        config,
+        f"https://discord.com/api/v10/channels/{channel_id}/messages",
+        {"content": message},
+        "direct message",
+    )
     message_id = result.get("id")
     if not message_id:
         raise RuntimeError("Discord did not return a message ID")
@@ -268,8 +349,13 @@ class WhisperTranscriber:
 
 def run(config: Config, *, dry_run: bool = False, discord_test: bool = False) -> int:
     if discord_test:
-        message_id = send_discord_message(config, "UA Dialer Discord bot test")
-        print(f"Discord test message sent: {message_id}")
+        for profile in config.profiles:
+            message_id = send_discord_dm(
+                config,
+                profile.discord_user_id,
+                "UA Dialer Discord bot test",
+            )
+            print(f"Discord test message sent to {profile.name}: {message_id}")
         return 0
 
     twiml = build_twiml(config)
@@ -322,12 +408,20 @@ def run(config: Config, *, dry_run: bool = False, discord_test: bool = False) ->
     finally:
         recording_path.unlink(missing_ok=True)
 
-    if keyword_found(transcript):
-        message_id = send_discord_message(config, config.discord_message)
-        print(f"Keyword detected; Discord bot notification sent: {message_id}")
-        return 0
+    notification_count = 0
+    for profile in config.profiles:
+        matched_colors = find_detected_colors(transcript, profile.colors)
+        if not matched_colors:
+            continue
+        message = f"Today's color(s) you follow: {', '.join(matched_colors)}."
+        if len(message) > 2000:
+            raise ValueError(f"Discord notification for {profile.name} exceeds 2000 characters")
+        message_id = send_discord_dm(config, profile.discord_user_id, message)
+        print(f"Detected {', '.join(matched_colors)}; DM sent to {profile.name}: {message_id}")
+        notification_count += 1
 
-    print("Keyword was not detected; no Discord message was sent.")
+    if notification_count == 0:
+        print("No configured colors were detected; no Discord messages were sent.")
     return 0
 
 
@@ -342,7 +436,7 @@ def parse_args() -> argparse.Namespace:
     run_mode.add_argument(
         "--discord-test",
         action="store_true",
-        help="Send one test message to the configured Discord webhook without placing a call",
+        help="Send a test DM to every configured user without placing a call",
     )
     parser.add_argument("--call-to-number", help="Override CALL_TO_NUMBER for this run")
     parser.add_argument("--dtmf-digits", help="Override DTMF_DIGITS for this run")
