@@ -22,4 +22,8 @@ The GitHub Actions workflow schedules runs at 10:00 and 11:00 UTC and proceeds o
 
 In the repository's **Settings > Secrets and variables > Actions**, add these repository secrets: `SIGNALWIRE_PROJECT_ID`, `SIGNALWIRE_API_TOKEN`, `SIGNALWIRE_FROM_NUMBER`, `DISCORD_BOT_TOKEN`, `DIALER_PROFILES_JSON`, `CALL_TO_NUMBER`, and `DTMF_DIGITS`. The profile secret contains each recipient's Discord user ID and colors; never commit real profile data to the repository. Add `SIGNALWIRE_SPACE` as a repository variable. Optional variables are `WHISPER_MODEL` (defaults to `base`) and `LISTEN_DURATION_SECONDS` (defaults to `60`).
 
+## Manage recipients
+
+Run `python manage_profiles.py` from this folder to list, add, or remove people. The manager saves the list to a local `dialer-profiles.json` file, which is excluded from Git. Choose **Generate JSON for GitHub** and copy the displayed JSON into the repository's `DIALER_PROFILES_JSON` Actions secret. Updating the local list does not update GitHub automatically; generate and save the secret again after changes.
+
 Commit and push the workflow to the repository's default branch. Before enabling the schedule, verify that the person answering the call has consented to recurring calls and recordings, and check call, recording, and provider requirements and charges. Calls play only the configured DTMF tones; no spoken prompt or other audio is played. Keep credentials, the Discord bot token, and recipient profiles in GitHub Actions secrets, never in the repository or workflow file.
