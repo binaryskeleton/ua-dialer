@@ -1,13 +1,16 @@
 import io
 import os
+import tempfile
 import unittest
 from contextlib import redirect_stdout
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, call, patch
 
 from dialer import (
     Config,
     RecipientProfile,
+    download_recording,
     find_detected_colors,
     parse_profiles,
     run,
@@ -118,6 +121,51 @@ class DiscordTests(unittest.TestCase):
                 ),
             ],
         )
+
+
+class RecordingTests(unittest.TestCase):
+    def test_download_uses_canonical_recording_media_endpoint(self) -> None:
+        config = SimpleNamespace(
+            signalwire_space_url="https://example.signalwire.com",
+            signalwire_project_id="project-id",
+            signalwire_api_token="api-token",
+            recording_format="mp3",
+        )
+        response = Mock()
+        response.content = b"audio-bytes"
+
+        with tempfile.TemporaryDirectory() as directory:
+            destination = Path(directory) / "recording.mp3"
+            with patch("requests.get", return_value=response) as get:
+                download_recording(
+                    {
+                        "sid": "recording-sid",
+                        "uri": "/Calls/call/Recordings/recording-sid.json",
+                    },
+                    config,
+                    destination,
+                )
+
+            get.assert_called_once_with(
+                "https://example.signalwire.com/api/laml/2010-04-01/"
+                "Accounts/project-id/Recordings/recording-sid.mp3",
+                auth=("project-id", "api-token"),
+                timeout=60,
+            )
+            response.raise_for_status.assert_called_once_with()
+            self.assertEqual(destination.read_bytes(), b"audio-bytes")
+
+    def test_download_fails_clearly_if_recording_sid_is_missing(self) -> None:
+        config = SimpleNamespace(
+            signalwire_space_url="https://example.signalwire.com",
+            signalwire_project_id="project-id",
+            signalwire_api_token="api-token",
+            recording_format="mp3",
+        )
+        with patch("requests.get") as get:
+            with self.assertRaisesRegex(RuntimeError, "recording SID"):
+                download_recording({"uri": "/recording.json"}, config, Path("recording.mp3"))
+        get.assert_not_called()
 
 
 class RoutingTests(unittest.TestCase):

@@ -328,9 +328,13 @@ def wait_for_recording(
 def download_recording(recording: Mapping[str, Any], config: Config, destination: Path) -> None:
     import requests
 
-    recording_uri = str(recording["uri"])
-    recording_path = recording_uri.removesuffix(".json")
-    recording_url = f"{config.signalwire_space_url}{recording_path}.{config.recording_format}"
+    recording_sid = recording.get("sid")
+    if not recording_sid:
+        raise RuntimeError("SignalWire recording did not include a recording SID")
+    recording_url = (
+        f"{config.signalwire_space_url}/api/laml/2010-04-01/Accounts/"
+        f"{config.signalwire_project_id}/Recordings/{recording_sid}.{config.recording_format}"
+    )
     response = requests.get(
         recording_url,
         auth=(config.signalwire_project_id, config.signalwire_api_token),
