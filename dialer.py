@@ -17,6 +17,8 @@ from xml.etree import ElementTree
 from dotenv import load_dotenv
 
 TERMINAL_CALL_STATUSES = {"completed", "busy", "failed", "no-answer", "canceled"}
+RECORDING_DOWNLOAD_ATTEMPTS = 5
+RECORDING_DOWNLOAD_RETRY_DELAY_SECONDS = 15
 
 load_dotenv(Path(__file__).with_name(".env"), override=True)
 
@@ -335,13 +337,24 @@ def download_recording(recording: Mapping[str, Any], config: Config, destination
         f"{config.signalwire_space_url}/api/laml/2010-04-01/Accounts/"
         f"{config.signalwire_project_id}/Recordings/{recording_sid}.{config.recording_format}"
     )
-    response = requests.get(
-        recording_url,
-        auth=(config.signalwire_project_id, config.signalwire_api_token),
-        timeout=60,
-    )
-    response.raise_for_status()
-    destination.write_bytes(response.content)
+    for attempt in range(RECORDING_DOWNLOAD_ATTEMPTS):
+        response = requests.get(
+            recording_url,
+            auth=(config.signalwire_project_id, config.signalwire_api_token),
+            timeout=60,
+        )
+        if response.status_code == 404:
+            if attempt < RECORDING_DOWNLOAD_ATTEMPTS - 1:
+                time.sleep(RECORDING_DOWNLOAD_RETRY_DELAY_SECONDS)
+                continue
+            raise RuntimeError(
+                f"SignalWire recording {recording_sid} media was unavailable (HTTP 404) "
+                f"after {RECORDING_DOWNLOAD_ATTEMPTS} attempts. Check that the recording "
+                "has completed and its media is accessible in SignalWire."
+            )
+        response.raise_for_status()
+        destination.write_bytes(response.content)
+        return
 
 
 class WhisperTranscriber:

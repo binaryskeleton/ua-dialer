@@ -167,6 +167,45 @@ class RecordingTests(unittest.TestCase):
                 download_recording({"uri": "/recording.json"}, config, Path("recording.mp3"))
         get.assert_not_called()
 
+    def test_download_retries_when_recording_media_is_not_ready(self) -> None:
+        config = SimpleNamespace(
+            signalwire_space_url="https://example.signalwire.com",
+            signalwire_project_id="project-id",
+            signalwire_api_token="api-token",
+            recording_format="mp3",
+        )
+        not_ready = Mock(status_code=404)
+        available = Mock(status_code=200, content=b"audio-bytes")
+        with tempfile.TemporaryDirectory() as directory:
+            destination = Path(directory) / "recording.mp3"
+            with (
+                patch("requests.get", side_effect=[not_ready, available]) as get,
+                patch("dialer.time.sleep") as sleep,
+            ):
+                download_recording({"sid": "recording-sid"}, config, destination)
+
+            self.assertEqual(get.call_count, 2)
+            sleep.assert_called_once_with(15)
+            self.assertEqual(destination.read_bytes(), b"audio-bytes")
+
+    def test_download_reports_when_recording_media_remains_unavailable(self) -> None:
+        config = SimpleNamespace(
+            signalwire_space_url="https://example.signalwire.com",
+            signalwire_project_id="project-id",
+            signalwire_api_token="api-token",
+            recording_format="mp3",
+        )
+        not_ready = Mock(status_code=404)
+        with (
+            patch("requests.get", return_value=not_ready) as get,
+            patch("dialer.time.sleep") as sleep,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "after 5 attempts"):
+                download_recording({"sid": "recording-sid"}, config, Path("recording.mp3"))
+
+        self.assertEqual(get.call_count, 5)
+        self.assertEqual(sleep.call_count, 4)
+
 
 class RoutingTests(unittest.TestCase):
     def test_run_notifies_only_profiles_with_detected_colors(self) -> None:
