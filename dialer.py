@@ -444,16 +444,20 @@ def run(
     for profile in config.profiles:
         matched_colors = find_detected_colors(transcript, profile.colors)
         if not matched_colors:
-            continue
-        message = f"Today's color(s) you follow: {', '.join(matched_colors)}."
+            message = "Your color was not called."
+        else:
+            message = f"Today's color(s) you follow: {', '.join(matched_colors)}."
         if len(message) > 2000:
             raise ValueError(f"Discord notification for {profile.name} exceeds 2000 characters")
         message_id = send_discord_dm(config, profile.discord_user_id, message)
-        print(f"Detected {', '.join(matched_colors)}; DM sent to {profile.name}: {message_id}")
+        if matched_colors:
+            print(f"Detected {', '.join(matched_colors)}; DM sent to {profile.name}: {message_id}")
+        else:
+            print(f"No followed color was detected; DM sent to {profile.name}: {message_id}")
         notification_count += 1
 
     if notification_count == 0:
-        print("No configured colors were detected; no Discord messages were sent.")
+        print("No recipient profiles are configured; no Discord messages were sent.")
     return 0
 
 

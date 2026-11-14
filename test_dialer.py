@@ -208,7 +208,7 @@ class RecordingTests(unittest.TestCase):
 
 
 class RoutingTests(unittest.TestCase):
-    def test_run_notifies_only_profiles_with_detected_colors(self) -> None:
+    def test_run_notifies_profiles_with_detected_or_missing_colors(self) -> None:
         profiles = (
             RecipientProfile("Alice", "12345678901234567", ("yellow", "red")),
             RecipientProfile("Bob", "12345678901234568", ("blue",)),
@@ -233,7 +233,10 @@ class RoutingTests(unittest.TestCase):
             patch("dialer.wait_for_recording", return_value={"uri": "/recording.json"}),
             patch("dialer.download_recording"),
             patch("dialer.WhisperTranscriber") as transcriber,
-            patch("dialer.send_discord_dm", side_effect=["message-1", "message-2"]) as send_dm,
+            patch(
+                "dialer.send_discord_dm",
+                side_effect=["message-1", "message-2", "message-3"],
+            ) as send_dm,
         ):
             transcriber.return_value.transcribe.return_value = "I heard yellow and BLUE."
 
@@ -245,6 +248,7 @@ class RoutingTests(unittest.TestCase):
             [
                 call(config, "12345678901234567", "Today's color(s) you follow: yellow."),
                 call(config, "12345678901234568", "Today's color(s) you follow: blue."),
+                call(config, "12345678901234569", "Your color was not called."),
             ],
         )
 
