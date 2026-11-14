@@ -12,20 +12,52 @@ from typing import Callable
 import requests
 from nacl.public import PublicKey, SealedBox
 
-from dialer import RecipientProfile, parse_profiles
+from dialer import (
+    Config,
+    ProfileConfiguration,
+    RecipientProfile,
+    parse_profile_configuration,
+    run,
+)
 
 PROFILES_FILE = Path(__file__).with_name("dialer-profiles.json")
 GITHUB_REPOSITORY = "binaryskeleton/ua-dialer"
 GITHUB_SECRET_NAME = "DIALER_PROFILES_JSON"
 
 
+def run_transcription_test_dm(profile: RecipientProfile) -> int:
+    config = Config.from_environment(
+        transcription_dm_test=True,
+        profiles_override=(profile,),
+    )
+    return run(config, transcription_dm_test=True)
+
+
+def run_color_test(color: str) -> int:
+    normalized_color = " ".join(color.split())
+    if not normalized_color:
+        raise ValueError("A color is required")
+    config = Config.from_environment(
+        transcription_test=True,
+        profiles_override=(),
+    )
+    return run(config, transcription_test=True, color_test=normalized_color)
+
+
 def load_profiles(path: Path = PROFILES_FILE) -> tuple[RecipientProfile, ...]:
+    return load_profile_configuration(path).profiles
+
+
+def load_profile_configuration(path: Path = PROFILES_FILE) -> ProfileConfiguration:
     if not path.exists():
-        return ()
-    return parse_profiles(path.read_text(encoding="utf-8"))
+        return ProfileConfiguration(())
+    return parse_profile_configuration(path.read_text(encoding="utf-8"))
 
 
-def save_profiles(path: Path, profiles: tuple[RecipientProfile, ...]) -> None:
+def _profiles_configuration_data(
+    profiles: tuple[RecipientProfile, ...],
+    color_aliases: tuple[tuple[str, str], ...],
+) -> list[dict[str, object]] | dict[str, object]:
     serialized = [
         {
             "name": profile.name,
@@ -34,28 +66,45 @@ def save_profiles(path: Path, profiles: tuple[RecipientProfile, ...]) -> None:
         }
         for profile in profiles
     ]
+    if color_aliases:
+        return {
+            "profiles": serialized,
+            "color_aliases": dict(color_aliases),
+        }
+    return serialized
+
+
+def save_profiles(
+    path: Path,
+    profiles: tuple[RecipientProfile, ...],
+    color_aliases: tuple[tuple[str, str], ...] = (),
+) -> None:
     path.write_text(
-        json.dumps(serialized, ensure_ascii=False, indent=2) + "\n",
+        json.dumps(
+            _profiles_configuration_data(profiles, color_aliases),
+            ensure_ascii=False,
+            indent=2,
+        ) + "\n",
         encoding="utf-8",
     )
 
 
-def profiles_json(profiles: tuple[RecipientProfile, ...]) -> str:
-    serialized = [
-        {
-            "name": profile.name,
-            "discord_user_id": profile.discord_user_id,
-            "colors": list(profile.colors),
-        }
-        for profile in profiles
-    ]
-    return json.dumps(serialized, ensure_ascii=False, separators=(",", ":"))
+def profiles_json(
+    profiles: tuple[RecipientProfile, ...],
+    color_aliases: tuple[tuple[str, str], ...] = (),
+) -> str:
+    return json.dumps(
+        _profiles_configuration_data(profiles, color_aliases),
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
 
 
 def upload_profiles_to_github(
     profiles: tuple[RecipientProfile, ...],
     token: str,
     *,
+    color_aliases: tuple[tuple[str, str], ...] = (),
     repository: str = GITHUB_REPOSITORY,
 ) -> None:
     if not token.strip():
@@ -88,7 +137,7 @@ def upload_profiles_to_github(
         key_id = public_key_data["key_id"]
         encrypted_value = SealedBox(
             PublicKey(b64decode(public_key, validate=True))
-        ).encrypt(profiles_json(profiles).encode("utf-8"))
+        ).encrypt(profiles_json(profiles, color_aliases).encode("utf-8"))
     except (ValueError, KeyError, TypeError) as exc:
         raise RuntimeError("GitHub returned an invalid repository encryption key") from exc
 
@@ -122,20 +171,43 @@ def _show_profiles(profiles: tuple[RecipientProfile, ...], output_fn: Callable[[
         )
 
 
+def _show_color_aliases(
+    color_aliases: tuple[tuple[str, str], ...],
+    output_fn: Callable[[str], None],
+) -> None:
+    if not color_aliases:
+        output_fn("No global color aliases are configured.")
+        return
+    output_fn(
+        "Global color aliases: "
+        + ", ".join(f"{alias} → {color}" for alias, color in color_aliases)
+    )
+
+
 def run_manager(
     path: Path = PROFILES_FILE,
     *,
     input_fn: Callable[[str], str] | None = None,
     output_fn: Callable[[str], None] = print,
     token_prompt: Callable[[str], str] | None = None,
+    transcription_test_runner: Callable[[RecipientProfile], int] | None = None,
+    color_test_runner: Callable[[str], int] | None = None,
 ) -> int:
     read_input = input if input_fn is None else input_fn
     read_token = getpass if token_prompt is None else token_prompt
+    run_transcription_test = (
+        run_transcription_test_dm
+        if transcription_test_runner is None
+        else transcription_test_runner
+    )
+    run_color_check = run_color_test if color_test_runner is None else color_test_runner
     try:
-        profiles = load_profiles(path)
+        profile_configuration = load_profile_configuration(path)
     except (OSError, ValueError) as exc:
         print(f"Could not load {path}: {exc}", file=sys.stderr)
         return 1
+    profiles = profile_configuration.profiles
+    color_aliases = profile_configuration.color_aliases
 
     while True:
         output_fn("\nUser profile manager")
@@ -144,7 +216,10 @@ def run_manager(
         output_fn("3. Remove user")
         output_fn("4. Generate JSON for GitHub")
         output_fn("5. Upload profiles to GitHub")
-        output_fn("6. Exit")
+        output_fn("6. Call and DM transcript (real call)")
+        output_fn("7. Call and check a color (real call)")
+        output_fn("8. Add or update a global color alias")
+        output_fn("9. Exit")
         choice = read_input("Choose an option: ").strip()
 
         if choice == "1":
@@ -158,23 +233,22 @@ def run_manager(
                 if color.strip()
             ]
             try:
-                updated = parse_profiles(
-                    json.dumps(
-                        [
-                            {
-                                "name": profile.name,
-                                "discord_user_id": profile.discord_user_id,
-                                "colors": list(profile.colors),
-                            }
-                            for profile in (*profiles, RecipientProfile(name, discord_user_id, tuple(colors)))
-                        ]
+                updated_configuration = parse_profile_configuration(
+                    profiles_json(
+                        (*profiles, RecipientProfile(name, discord_user_id, tuple(colors))),
+                        color_aliases,
                     )
                 )
-                save_profiles(path, updated)
+                save_profiles(
+                    path,
+                    updated_configuration.profiles,
+                    updated_configuration.color_aliases,
+                )
             except (OSError, ValueError) as exc:
                 output_fn(f"Could not add user: {exc}")
             else:
-                profiles = updated
+                profiles = updated_configuration.profiles
+                color_aliases = updated_configuration.color_aliases
                 output_fn(f"Added {name}.")
         elif choice == "3":
             _show_profiles(profiles, output_fn)
@@ -188,19 +262,30 @@ def run_manager(
                 if not 1 <= index <= len(profiles):
                     raise ValueError("Choose a number from the list.")
                 updated = profiles[:index - 1] + profiles[index:]
-                save_profiles(path, updated)
+                remaining_colors = {
+                    color.casefold()
+                    for profile in updated
+                    for color in profile.colors
+                }
+                updated_aliases = tuple(
+                    (alias, color)
+                    for alias, color in color_aliases
+                    if color.casefold() in remaining_colors
+                )
+                save_profiles(path, updated, updated_aliases)
             except (OSError, ValueError) as exc:
                 output_fn(f"Could not remove user: {exc}")
             else:
                 removed = profiles[index - 1]
                 profiles = updated
+                color_aliases = updated_aliases
                 output_fn(f"Removed {removed.name}.")
         elif choice == "4":
             if not profiles:
                 output_fn("Add at least one user before generating the JSON.")
                 continue
             output_fn("Copy this JSON into the GitHub DIALER_PROFILES_JSON secret:")
-            output_fn(profiles_json(profiles))
+            output_fn(profiles_json(profiles, color_aliases))
         elif choice == "5":
             if not profiles:
                 output_fn("Add at least one user before uploading profiles.")
@@ -211,16 +296,105 @@ def run_manager(
                 continue
             token = read_token("GitHub token (input hidden): ")
             try:
-                upload_profiles_to_github(profiles, token)
+                upload_profiles_to_github(
+                    profiles,
+                    token,
+                    color_aliases=color_aliases,
+                )
             except (ValueError, RuntimeError) as exc:
                 output_fn(f"Upload failed: {exc}")
             else:
                 output_fn(f"Uploaded profiles to {GITHUB_REPOSITORY}/{GITHUB_SECRET_NAME}.")
         elif choice == "6":
+            if not profiles:
+                output_fn("Add a user before running a transcription test.")
+                continue
+            _show_profiles(profiles, output_fn)
+            selection = read_input(
+                "Enter the profile number to receive the transcript, or press Enter to cancel: "
+            ).strip()
+            if not selection:
+                output_fn("Transcription test canceled.")
+                continue
+            try:
+                index = int(selection)
+                if not 1 <= index <= len(profiles):
+                    raise ValueError("Choose a number from the list.")
+            except ValueError as exc:
+                output_fn(f"Invalid profile selection: {exc}")
+                continue
+            profile = profiles[index - 1]
+            output_fn(
+                "This places a real SignalWire call and sends the full transcript "
+                f"to {profile.name} by Discord DM. Call charges may apply."
+            )
+            if read_input("Type yes to place the call: ").strip().casefold() != "yes":
+                output_fn("Transcription test canceled.")
+                continue
+            try:
+                result = run_transcription_test(profile)
+            except (OSError, RuntimeError, TimeoutError, ValueError, requests.RequestException) as exc:
+                output_fn(f"Transcription test failed: {exc}")
+            else:
+                if result == 0:
+                    output_fn(f"Transcription test completed for {profile.name}.")
+                else:
+                    output_fn(f"Transcription test failed with exit code {result}.")
+        elif choice == "7":
+            color = read_input("Color to check: ").strip()
+            if not color:
+                output_fn("Enter a color to check.")
+                continue
+            output_fn(
+                "This places a real SignalWire call, prints the full transcript locally, "
+                "and checks for the selected color. Call charges may apply."
+            )
+            if read_input("Type yes to place the call: ").strip().casefold() != "yes":
+                output_fn("Color test canceled.")
+                continue
+            try:
+                result = run_color_check(color)
+            except (OSError, RuntimeError, TimeoutError, ValueError, requests.RequestException) as exc:
+                output_fn(f"Color test failed: {exc}")
+            else:
+                if result == 0:
+                    output_fn("Color test completed.")
+                else:
+                    output_fn(f"Color test failed with exit code {result}.")
+        elif choice == "8":
+            if not profiles:
+                output_fn("Add a user before configuring global color aliases.")
+                continue
+            _show_color_aliases(color_aliases, output_fn)
+            alias = read_input("Alternate word or phrase Whisper may transcribe: ").strip()
+            if not alias:
+                output_fn("Color alias canceled.")
+                continue
+            color = read_input("Followed color this alias should match: ").strip()
+            aliases = tuple(
+                (saved_alias, saved_color)
+                for saved_alias, saved_color in color_aliases
+                if saved_alias.casefold() != alias.casefold()
+            ) + ((alias, color),)
+            try:
+                updated_configuration = parse_profile_configuration(
+                    profiles_json(profiles, aliases)
+                )
+                save_profiles(
+                    path,
+                    updated_configuration.profiles,
+                    updated_configuration.color_aliases,
+                )
+            except (OSError, ValueError) as exc:
+                output_fn(f"Could not save color alias: {exc}")
+            else:
+                color_aliases = updated_configuration.color_aliases
+                output_fn(f"Saved global alias {alias!r} for {color!r} across all profiles.")
+        elif choice == "9":
             output_fn(f"Saved user list: {path}")
             return 0
         else:
-            output_fn("Enter a number from 1 to 6.")
+            output_fn("Enter a number from 1 to 9.")
 
 
 if __name__ == "__main__":

@@ -31,6 +31,12 @@ class RecipientProfile:
 
 
 @dataclass(frozen=True)
+class ProfileConfiguration:
+    profiles: tuple[RecipientProfile, ...]
+    color_aliases: tuple[tuple[str, str], ...] = ()
+
+
+@dataclass(frozen=True)
 class Config:
     signalwire_project_id: str
     signalwire_api_token: str
@@ -41,6 +47,7 @@ class Config:
     dtmf_digits: str
     whisper_model: str
     profiles: tuple[RecipientProfile, ...]
+    color_aliases: tuple[tuple[str, str], ...] = ()
     poll_interval_seconds: int = 15
     poll_timeout_seconds: int = 1800
     listen_duration_seconds: int = 60
@@ -53,6 +60,8 @@ class Config:
         dry_run: bool = False,
         discord_test: bool = False,
         transcription_test: bool = False,
+        transcription_dm_test: bool = False,
+        profiles_override: tuple[RecipientProfile, ...] | None = None,
         overrides: Mapping[str, str] | None = None,
     ) -> "Config":
         values = {
@@ -82,7 +91,10 @@ class Config:
         if not dry_run and not discord_test and not transcription_test:
             required.append("discord_bot_token")
         missing = [name for name in required if not values[name]]
-        if (discord_test or (not dry_run and not transcription_test)) and not profiles_json:
+        needs_profiles = discord_test or (
+            not dry_run and not transcription_test
+        )
+        if needs_profiles and profiles_override is None and not profiles_json:
             missing.append("DIALER_PROFILES_JSON")
         if missing:
             raise ValueError(f"Missing required environment variables: {', '.join(missing)}")
@@ -105,7 +117,17 @@ class Config:
                 raise ValueError("SIGNALWIRE_SPACE must be a SignalWire Space hostname or HTTPS URL")
             values["signalwire_space_url"] = values["signalwire_space_url"].rstrip("/")
 
-        profiles = parse_profiles(profiles_json) if profiles_json else ()
+        if profiles_override is not None:
+            profiles = profiles_override
+            color_aliases = ()
+        else:
+            profile_configuration = (
+                parse_profile_configuration(profiles_json)
+                if profiles_json
+                else ProfileConfiguration(())
+            )
+            profiles = profile_configuration.profiles
+            color_aliases = profile_configuration.color_aliases
         if (discord_test or (not dry_run and not transcription_test)) and not profiles:
             raise ValueError("DIALER_PROFILES_JSON must contain at least one recipient profile")
 
@@ -115,6 +137,7 @@ class Config:
         return cls(
             **values,
             profiles=profiles,
+            color_aliases=color_aliases,
             poll_interval_seconds=_positive_int_from_env("POLL_INTERVAL_SECONDS", 15),
             poll_timeout_seconds=_positive_int_from_env("POLL_TIMEOUT_SECONDS", 1800),
             listen_duration_seconds=listen_duration_seconds,
@@ -123,12 +146,44 @@ class Config:
 
 
 def parse_profiles(profiles_json: str) -> tuple[RecipientProfile, ...]:
+    return parse_profile_configuration(profiles_json).profiles
+
+
+def parse_profile_configuration(profiles_json: str) -> ProfileConfiguration:
     try:
-        raw_profiles = json.loads(profiles_json)
+        raw_configuration = json.loads(profiles_json)
     except json.JSONDecodeError as exc:
         raise ValueError("DIALER_PROFILES_JSON must be valid JSON") from exc
+    if isinstance(raw_configuration, list):
+        raw_profiles = raw_configuration
+        raw_aliases: object = {}
+    elif isinstance(raw_configuration, dict):
+        raw_profiles = raw_configuration.get("profiles")
+        raw_aliases = raw_configuration.get("color_aliases", {})
+    else:
+        raise ValueError("DIALER_PROFILES_JSON must be a JSON array or object")
+    if not isinstance(raw_aliases, dict):
+        raise ValueError("Color aliases must be a JSON object")
+    merged_aliases = dict(raw_aliases)
+    if isinstance(raw_profiles, list):
+        for raw_profile in raw_profiles:
+            if not isinstance(raw_profile, dict):
+                continue
+            profile_aliases = raw_profile.get("color_aliases", {})
+            if not isinstance(profile_aliases, dict):
+                raise ValueError("Color aliases must be a JSON object")
+            for alias, color in profile_aliases.items():
+                if alias in merged_aliases and merged_aliases[alias] != color:
+                    raise ValueError(f"Color alias {alias!r} has conflicting mappings")
+                merged_aliases[alias] = color
+    profiles = _parse_profiles(raw_profiles)
+    aliases = _parse_color_aliases(merged_aliases, profiles)
+    return ProfileConfiguration(profiles, aliases)
+
+
+def _parse_profiles(raw_profiles: object) -> tuple[RecipientProfile, ...]:
     if not isinstance(raw_profiles, list):
-        raise ValueError("DIALER_PROFILES_JSON must be a JSON array")
+        raise ValueError("DIALER_PROFILES_JSON profiles must be a JSON array")
 
     profiles: list[RecipientProfile] = []
     seen_user_ids: set[str] = set()
@@ -172,6 +227,42 @@ def parse_profiles(profiles_json: str) -> tuple[RecipientProfile, ...]:
     return tuple(profiles)
 
 
+def _parse_color_aliases(
+    raw_aliases: object,
+    profiles: tuple[RecipientProfile, ...],
+) -> tuple[tuple[str, str], ...]:
+    if not isinstance(raw_aliases, dict):
+        raise ValueError("Color aliases must be a JSON object")
+
+    colors_by_key: dict[str, str] = {}
+    for profile in profiles:
+        for color in profile.colors:
+            colors_by_key.setdefault(color.casefold(), color)
+    aliases: list[tuple[str, str]] = []
+    seen_aliases: set[str] = set()
+    for alias, color in raw_aliases.items():
+        if not isinstance(alias, str) or not isinstance(color, str):
+            raise ValueError("Color aliases must map strings to strings")
+        normalized_alias = " ".join(alias.split())
+        normalized_color = " ".join(color.split())
+        if not normalized_alias or len(normalized_alias) > 60:
+            raise ValueError("Color aliases must contain 1 to 60 characters")
+        alias_key = normalized_alias.casefold()
+        color_key = normalized_color.casefold()
+        if color_key not in colors_by_key:
+            raise ValueError(f"Color alias {normalized_alias!r} must map to a followed color")
+        if alias_key in seen_aliases:
+            raise ValueError(f"Color alias {normalized_alias!r} appears more than once")
+        if alias_key in colors_by_key and alias_key != color_key:
+            raise ValueError(f"Color alias {normalized_alias!r} conflicts with a followed color")
+        if alias_key == color_key:
+            raise ValueError(f"Color alias {normalized_alias!r} must differ from its followed color")
+        aliases.append((normalized_alias, colors_by_key[color_key]))
+        seen_aliases.add(alias_key)
+
+    return tuple(aliases)
+
+
 def _positive_int_from_env(name: str, default: int) -> int:
     raw_value = os.getenv(name, str(default))
     try:
@@ -190,12 +281,19 @@ def build_twiml(config: Config) -> str:
     return ElementTree.tostring(response, encoding="unicode", xml_declaration=True)
 
 
-def find_detected_colors(transcript: str, colors: tuple[str, ...]) -> tuple[str, ...]:
+def find_detected_colors(
+    transcript: str,
+    colors: tuple[str, ...],
+    color_aliases: tuple[tuple[str, str], ...] = (),
+) -> tuple[str, ...]:
     detected: list[str] = []
     for color in colors:
-        color_pattern = r"\s+".join(re.escape(part) for part in color.split())
-        if re.search(rf"(?<!\w){color_pattern}(?!\w)", transcript, flags=re.IGNORECASE):
-            detected.append(color)
+        phrases = (color, *(alias for alias, target in color_aliases if target.casefold() == color.casefold()))
+        for phrase in phrases:
+            color_pattern = r"\s+".join(re.escape(part) for part in phrase.split())
+            if re.search(rf"(?<!\w){color_pattern}(?!\w)", transcript, flags=re.IGNORECASE):
+                detected.append(color)
+                break
     return tuple(detected)
 
 
@@ -279,6 +377,25 @@ def send_discord_dm(config: Config, user_id: str, message: str) -> str:
     if not message_id:
         raise RuntimeError("Discord did not return a message ID")
     return str(message_id)
+
+
+def send_transcription_dm(config: Config, profile: RecipientProfile, transcript: str) -> int:
+    content = transcript or "(No speech was transcribed.)"
+    chunks: list[str] = []
+    start = 0
+    while start < len(content):
+        end = min(start + 1800, len(content))
+        if end < len(content):
+            boundary = content.rfind(" ", start + 1, end + 1)
+            if boundary > start:
+                end = boundary
+        chunks.append(content[start:end])
+        start = end
+
+    for index, chunk in enumerate(chunks, start=1):
+        message = f"Transcription test ({index}/{len(chunks)}):\n{chunk}"
+        send_discord_dm(config, profile.discord_user_id, message)
+    return len(chunks)
 
 
 def wait_for_call_completion(
@@ -374,7 +491,23 @@ def run(
     dry_run: bool = False,
     discord_test: bool = False,
     transcription_test: bool = False,
+    transcription_dm_test: bool = False,
+    color_test: str | None = None,
 ) -> int:
+    if transcription_test and transcription_dm_test:
+        raise ValueError("Choose either local transcription output or Discord transcription DM")
+    if color_test is not None:
+        color_test = " ".join(color_test.split())
+        if not color_test:
+            raise ValueError("A color is required for a color test")
+        if dry_run or discord_test or transcription_dm_test:
+            raise ValueError("A color test cannot be combined with other run modes")
+    if transcription_dm_test:
+        if not config.discord_bot_token:
+            raise ValueError("DISCORD_BOT_TOKEN is required to send the transcription by Discord DM")
+        if len(config.profiles) != 1:
+            raise ValueError("A transcription DM test must have exactly one recipient profile")
+
     if discord_test:
         for profile in config.profiles:
             message_id = send_discord_dm(
@@ -435,14 +568,25 @@ def run(
     finally:
         recording_path.unlink(missing_ok=True)
 
-    if transcription_test:
+    if transcription_test or transcription_dm_test or color_test is not None:
         print("Full transcript:")
         print(transcript if transcript else "(No speech was transcribed.)")
+        if color_test is not None:
+            detected = find_detected_colors(transcript, (color_test,))
+            result = "was detected" if detected else "was not detected"
+            print(f"Color check: {color_test!r} {result}.")
+        if transcription_dm_test:
+            profile = config.profiles[0]
+            message_count = send_transcription_dm(config, profile, transcript)
+            print(
+                f"Full transcript sent to {profile.name} in "
+                f"{message_count} Discord message(s)."
+            )
         return 0
 
     notification_count = 0
     for profile in config.profiles:
-        matched_colors = find_detected_colors(transcript, profile.colors)
+        matched_colors = find_detected_colors(transcript, profile.colors, config.color_aliases)
         if not matched_colors:
             message = "Your color was not called."
         else:
