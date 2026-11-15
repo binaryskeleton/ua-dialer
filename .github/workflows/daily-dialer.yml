@@ -2,11 +2,17 @@ name: Daily dialer
 
 on:
   schedule:
-    - cron: "0 10 * * *"
-    - cron: "0 11 * * *"
+    - cron: "0 8-12 * * 1-6"
   workflow_dispatch:
+    inputs:
+      validate_profiles_only:
+        description: Validate DIALER_PROFILES_JSON without placing a call
+        type: boolean
+        required: false
+        default: false
 
 permissions:
+  actions: read
   contents: read
 
 concurrency:
@@ -30,16 +36,130 @@ jobs:
       LISTEN_DURATION_SECONDS: ${{ vars.LISTEN_DURATION_SECONDS || '60' }}
 
     steps:
-      - name: Gate scheduled run to 4 a.m. Mountain Time
+      - name: Gate scheduled run to 2-5 a.m. Mountain Time
         id: schedule_gate
         shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          if [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" ]] || [[ "$(TZ=America/Denver date +%H)" == "04" ]]; then
+          if [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" ]]; then
             echo "run=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "run=false" >> "$GITHUB_OUTPUT"
-            echo "This UTC trigger is not 4 a.m. Mountain Time; skipping."
+            exit 0
           fi
+
+          local_hour=$(TZ=America/Denver date +%-H)
+          local_day=$(TZ=America/Denver date +%u)
+          if (( local_day == 7 )); then
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "Sunday in Mountain Time; no colors are spoken, so skipping."
+            exit 0
+          fi
+
+          if (( local_hour < 2 || local_hour > 5 )); then
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "This trigger is outside 2-5 a.m. Mountain Time; skipping."
+            exit 0
+          fi
+
+          python - <<'PY'
+          import json
+          import os
+          from datetime import datetime
+          from urllib.request import Request, urlopen
+          from zoneinfo import ZoneInfo
+
+          api = os.environ["GITHUB_API_URL"].rstrip("/")
+          repository = os.environ["GITHUB_REPOSITORY"]
+          token = os.environ["GH_TOKEN"]
+          today = datetime.now(ZoneInfo("America/Denver")).date()
+          current_run_id = os.environ["GITHUB_RUN_ID"]
+          headers = {
+              "Accept": "application/vnd.github+json",
+              "Authorization": f"Bearer {token}",
+              "X-GitHub-Api-Version": "2022-11-28",
+          }
+
+          def get_json(url):
+              request = Request(url, headers=headers)
+              with urlopen(request, timeout=30) as response:
+                  return json.load(response)
+
+          previous_runs = []
+          page = 1
+          while True:
+              url = (
+                  f"{api}/repos/{repository}/actions/workflows/daily-dialer.yml/runs"
+                  f"?per_page=100&page={page}"
+              )
+              runs = get_json(url)["workflow_runs"]
+              if not runs:
+                  break
+              older_run_found = False
+              for run in runs:
+                  if str(run["id"]) == current_run_id:
+                      continue
+                  created = datetime.fromisoformat(
+                      run["created_at"].replace("Z", "+00:00")
+                  ).astimezone(ZoneInfo("America/Denver"))
+                  if created.date() == today:
+                      previous_runs.append(run)
+                  elif created.date() < today:
+                      older_run_found = True
+              if older_run_found or len(runs) < 100:
+                  break
+              page += 1
+
+          successful_call_found = False
+          uncertain_run_found = False
+          for run in previous_runs:
+              if run["status"] != "completed":
+                  uncertain_run_found = True
+                  continue
+
+              jobs_url = (
+                  f"{api}/repos/{repository}/actions/runs/{run['id']}/jobs?per_page=100"
+              )
+              jobs = get_json(jobs_url)["jobs"]
+              dial_job = next((job for job in jobs if job["name"] == "dial"), None)
+              if dial_job is None:
+                  uncertain_run_found = True
+                  continue
+
+              call_step = next(
+                  (
+                      step
+                      for step in dial_job["steps"]
+                      if step["name"] == "Place call and process response"
+                  ),
+                  None,
+              )
+              if call_step is None:
+                  uncertain_run_found = True
+              elif call_step["conclusion"] == "success":
+                  successful_call_found = True
+              elif call_step["conclusion"] == "failure":
+                  print(f"Previous run {run['id']} failed at the call step; retrying.")
+              elif (
+                  call_step["conclusion"] == "skipped"
+                  and dial_job["conclusion"] in ("success", "failure")
+              ):
+                  print(f"Previous run {run['id']} did not reach the call step.")
+              else:
+                  uncertain_run_found = True
+
+          if successful_call_found:
+              print("A call already completed today; skipping to avoid a duplicate.")
+              should_run = "false"
+          elif uncertain_run_found:
+              print("A previous run is still active or has an uncertain outcome; skipping.")
+              should_run = "false"
+          else:
+              print("No successful or uncertain call attempt exists today; running.")
+              should_run = "true"
+
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              output.write(f"run={should_run}\n")
+          PY
 
       - name: Check out repository
         if: steps.schedule_gate.outputs.run == 'true'
@@ -54,16 +174,53 @@ jobs:
           cache-dependency-path: requirements.txt
 
       - name: Cache Whisper model
-        if: steps.schedule_gate.outputs.run == 'true'
+        if: steps.schedule_gate.outputs.run == 'true' && inputs.validate_profiles_only != true
         uses: actions/cache@v6
         with:
           path: ~/.cache/huggingface/hub
           key: whisper-${{ runner.os }}-${{ vars.WHISPER_MODEL || 'base' }}
 
+      - name: Install profile validator dependency
+        if: steps.schedule_gate.outputs.run == 'true' && inputs.validate_profiles_only == true
+        run: python -m pip install python-dotenv
+
       - name: Install dependencies
-        if: steps.schedule_gate.outputs.run == 'true'
+        if: steps.schedule_gate.outputs.run == 'true' && inputs.validate_profiles_only != true
         run: python -m pip install -r requirements.txt
 
+      - name: Validate recipient profile secret (no call)
+        if: steps.schedule_gate.outputs.run == 'true' && inputs.validate_profiles_only == true
+        env:
+          DIALER_PROFILES_JSON: ${{ secrets.DIALER_PROFILES_JSON }}
+        run: |
+          python - <<'PY'
+          import os
+
+          profile_json = os.environ.get("DIALER_PROFILES_JSON", "")
+          if not profile_json:
+              raise SystemExit("DIALER_PROFILES_JSON is empty or unavailable.")
+
+          try:
+              from dialer import parse_profile_configuration
+
+              configuration = parse_profile_configuration(profile_json)
+          except ValueError:
+              raise SystemExit(
+                  "DIALER_PROFILES_JSON is invalid or does not match the expected profile format. "
+                  "Secret contents were not printed."
+              ) from None
+
+          if not configuration.profiles:
+              raise SystemExit("DIALER_PROFILES_JSON contains no profiles.")
+
+          print(
+              "DIALER_PROFILES_JSON is valid: "
+              f"{len(configuration.profiles)} profile(s), "
+              f"{len(configuration.color_aliases)} color alias(es)."
+          )
+          PY
+
       - name: Place call and process response
-        if: steps.schedule_gate.outputs.run == 'true'
+        if: steps.schedule_gate.outputs.run == 'true' && inputs.validate_profiles_only != true
+        id: place_call
         run: python dialer.py
