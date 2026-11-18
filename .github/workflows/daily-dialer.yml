@@ -32,8 +32,15 @@ jobs:
       DIALER_PROFILES_JSON: ${{ secrets.DIALER_PROFILES_JSON }}
       CALL_TO_NUMBER: ${{ secrets.CALL_TO_NUMBER }}
       DTMF_DIGITS: ${{ secrets.DTMF_DIGITS }}
+      TRANSCRIPTION_PROVIDER: ${{ vars.TRANSCRIPTION_PROVIDER || 'elevenlabs' }}
+      ELEVENLABS_API_KEY: ${{ secrets.ELEVENLABS_API_KEY }}
+      ELEVENLABS_LANGUAGE_CODE: ${{ vars.ELEVENLABS_LANGUAGE_CODE || 'eng' }}
+      AZURE_SPEECH_KEY: ${{ secrets.AZURE_SPEECH_KEY }}
+      AZURE_SPEECH_REGION: ${{ vars.AZURE_SPEECH_REGION }}
+      AZURE_SPEECH_LANGUAGE_CODE: ${{ vars.AZURE_SPEECH_LANGUAGE_CODE || 'en-US' }}
+      GOOGLE_SPEECH_LANGUAGE_CODE: ${{ vars.GOOGLE_SPEECH_LANGUAGE_CODE || 'en-US' }}
       WHISPER_MODEL: ${{ vars.WHISPER_MODEL || 'base' }}
-      LISTEN_DURATION_SECONDS: ${{ vars.LISTEN_DURATION_SECONDS || '60' }}
+      LISTEN_DURATION_SECONDS: ${{ vars.LISTEN_DURATION_SECONDS || '55' }}
 
     steps:
       - name: Gate scheduled run to 2-5 a.m. Mountain Time
@@ -173,8 +180,14 @@ jobs:
           cache: pip
           cache-dependency-path: requirements.txt
 
+      - name: Authenticate to Google Cloud
+        if: steps.schedule_gate.outputs.run == 'true' && inputs.validate_profiles_only != true && env.TRANSCRIPTION_PROVIDER == 'google'
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GOOGLE_CLOUD_SERVICE_ACCOUNT_KEY }}
+
       - name: Cache Whisper model
-        if: steps.schedule_gate.outputs.run == 'true' && inputs.validate_profiles_only != true
+        if: steps.schedule_gate.outputs.run == 'true' && inputs.validate_profiles_only != true && env.TRANSCRIPTION_PROVIDER == 'whisper'
         uses: actions/cache@v6
         with:
           path: ~/.cache/huggingface/hub

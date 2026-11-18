@@ -2,21 +2,29 @@ import io
 import os
 import tempfile
 import unittest
-from contextlib import redirect_stdout
+import wave
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, call, patch
 
 from dialer import (
+    AzureSpeechTranscriber,
     Config,
+    ElevenLabsSpeechTranscriber,
+    GoogleSpeechTranscriber,
     RecipientProfile,
+    WhisperTranscriber,
+    color_transcription_prompt,
     download_recording,
     find_detected_colors,
     parse_profile_configuration,
     parse_profiles,
     run,
+    recording_to_pcm_wav,
     send_discord_dm,
     send_transcription_dm,
+    text_after_color_list_cue,
 )
 
 
@@ -84,6 +92,31 @@ class ProfileTests(unittest.TestCase):
         self.assertEqual(config.profiles[0].name, "Alice")
         self.assertEqual(config.profiles[0].colors, ("yellow",))
         self.assertEqual(config.color_aliases, (("yelow", "yellow"),))
+
+    def test_from_environment_defaults_to_elevenlabs_and_validates_cloud_limits(self) -> None:
+        with patch.dict(
+            os.environ,
+            {"CALL_TO_NUMBER": "+15551230002", "DTMF_DIGITS": "1234"},
+            clear=True,
+        ):
+            config = Config.from_environment(dry_run=True)
+
+        self.assertEqual(config.transcription_provider, "elevenlabs")
+        self.assertEqual(config.elevenlabs_language_code, "eng")
+        self.assertEqual(config.listen_duration_seconds, 55)
+
+        with patch.dict(
+            os.environ,
+            {
+                "CALL_TO_NUMBER": "+15551230002",
+                "DTMF_DIGITS": "1234",
+                "TRANSCRIPTION_PROVIDER": "google",
+                "LISTEN_DURATION_SECONDS": "60",
+            },
+            clear=True,
+        ):
+            with self.assertRaisesRegex(ValueError, "less than 60"):
+                Config.from_environment(dry_run=True)
 
     def test_dry_run_does_not_require_discord_profiles_or_bot_token(self) -> None:
         with patch.dict(
@@ -265,7 +298,114 @@ class RecordingTests(unittest.TestCase):
         self.assertEqual(sleep.call_count, 4)
 
 
+class AzureSpeechTests(unittest.TestCase):
+    def test_recording_is_converted_to_azure_pcm_wav_format(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "recording.wav"
+            with wave.open(str(source), "wb") as audio_file:
+                audio_file.setnchannels(2)
+                audio_file.setsampwidth(2)
+                audio_file.setframerate(8000)
+                audio_file.writeframes(b"\0\0\0\0" * 8000)
+
+            converted = recording_to_pcm_wav(source)
+
+        with wave.open(io.BytesIO(converted), "rb") as audio_file:
+            self.assertEqual(audio_file.getnchannels(), 1)
+            self.assertEqual(audio_file.getsampwidth(), 2)
+            self.assertEqual(audio_file.getframerate(), 16000)
+
+    def test_transcriber_sends_wav_to_configured_azure_region(self) -> None:
+        response = Mock(ok=True)
+        response.json.return_value = {
+            "RecognitionStatus": "Success",
+            "DisplayText": "The groups for today are yellow.",
+        }
+
+        with (
+            patch("dialer.recording_to_pcm_wav", return_value=b"wav-audio"),
+            patch("requests.post", return_value=response) as post,
+        ):
+            transcript = AzureSpeechTranscriber("azure-key", "eastus", "en-US").transcribe(
+                Path("recording.mp3")
+            )
+
+        self.assertEqual(transcript, "The groups for today are yellow.")
+        post.assert_called_once_with(
+            "https://eastus.stt.speech.microsoft.com/"
+            "speech/recognition/conversation/cognitiveservices/v1",
+            params={"language": "en-US", "format": "simple"},
+            headers={
+                "Ocp-Apim-Subscription-Key": "azure-key",
+                "Content-Type": "audio/wav",
+            },
+            data=b"wav-audio",
+            timeout=60,
+        )
+
+
+class ElevenLabsSpeechTests(unittest.TestCase):
+    def test_transcriber_sends_recording_and_parses_transcript(self) -> None:
+        response = Mock(ok=True)
+        response.json.return_value = {"text": "The groups for today are yellow."}
+
+        with tempfile.TemporaryDirectory() as directory:
+            audio_path = Path(directory) / "recording.mp3"
+            audio_path.write_bytes(b"mp3-audio")
+
+            def capture_request(url: str, **kwargs: object) -> Mock:
+                self.assertEqual(
+                    url,
+                    "https://api.elevenlabs.io/v1/speech-to-text",
+                )
+                self.assertEqual(kwargs["files"]["file"][0], "recording.mp3")
+                self.assertEqual(kwargs["files"]["file"][1].read(), b"mp3-audio")
+                return response
+
+            with patch("requests.post", side_effect=capture_request) as post:
+                transcript = ElevenLabsSpeechTranscriber(
+                    "elevenlabs-key",
+                    "eng",
+                ).transcribe(audio_path)
+
+        self.assertEqual(transcript, "The groups for today are yellow.")
+        self.assertEqual(
+            post.call_args.kwargs["headers"],
+            {"xi-api-key": "elevenlabs-key"},
+        )
+        self.assertEqual(
+            post.call_args.kwargs["data"],
+            {"model_id": "scribe_v3", "language_code": "eng"},
+        )
+        self.assertEqual(post.call_args.kwargs["timeout"], 60)
+
+
 class RoutingTests(unittest.TestCase):
+    def test_missing_transcription_dependency_fails_before_placing_call(self) -> None:
+        config = Config(
+            signalwire_project_id="project",
+            signalwire_api_token="token",
+            signalwire_space_url="space.signalwire.com",
+            signalwire_from_number="+15551230000",
+            discord_bot_token="bot-token",
+            call_to_number="+15551230002",
+            dtmf_digits="1234",
+            whisper_model="base",
+            profiles=(RecipientProfile("Alice", "12345678901234567", ("yellow",)),),
+        )
+
+        with (
+            patch.dict("sys.modules", {"faster_whisper": None}),
+            patch("dialer.signalwire_request") as signalwire_request,
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "python -m pip install -r requirements.txt",
+            ):
+                run(config)
+
+        signalwire_request.assert_not_called()
+
     def test_run_notifies_profiles_with_detected_or_missing_colors(self) -> None:
         profiles = (
             RecipientProfile("Alice", "12345678901234567", ("yellow", "red")),
@@ -285,6 +425,7 @@ class RoutingTests(unittest.TestCase):
             recording_format="test",
         )
 
+        output = io.StringIO()
         with (
             patch("dialer.signalwire_request", return_value={"sid": "call-id"}),
             patch("dialer.wait_for_call_completion", return_value="completed"),
@@ -295,12 +436,20 @@ class RoutingTests(unittest.TestCase):
                 "dialer.send_discord_dm",
                 side_effect=["message-1", "message-2", "message-3"],
             ) as send_dm,
+            redirect_stdout(output),
         ):
-            transcriber.return_value.transcribe.return_value = "I heard yellow and BLUE."
+            transcriber.return_value.transcribe.return_value = (
+                "Earlier, red and green were mentioned. "
+                "The groups for today, Monday, November 16, are yellow and BLUE."
+            )
 
             result = run(config)
 
         self.assertEqual(result, 0)
+        self.assertIn("Configured profile colors:", output.getvalue())
+        self.assertIn("  Alice: yellow, red", output.getvalue())
+        self.assertIn("  Bob: blue", output.getvalue())
+        self.assertIn("  Casey: green", output.getvalue())
         self.assertEqual(
             send_dm.call_args_list,
             [
@@ -329,6 +478,7 @@ class RoutingTests(unittest.TestCase):
             recording_format="test",
         )
 
+        output = io.StringIO()
         with (
             patch("dialer.signalwire_request", return_value={"sid": "call-id"}),
             patch("dialer.wait_for_call_completion", return_value="completed"),
@@ -336,12 +486,16 @@ class RoutingTests(unittest.TestCase):
             patch("dialer.download_recording"),
             patch("dialer.WhisperTranscriber") as transcriber,
             patch("dialer.send_discord_dm", side_effect=["message-1", "message-2"]) as send_dm,
+            redirect_stdout(output),
         ):
-            transcriber.return_value.transcribe.return_value = "The speaker said frown."
+            transcriber.return_value.transcribe.return_value = (
+                "The groups for today, Monday, November 16, are frown."
+            )
 
             result = run(config)
 
         self.assertEqual(result, 0)
+        self.assertIn("Configured color aliases: frown -> brown", output.getvalue())
         self.assertEqual(
             send_dm.call_args_list,
             [
@@ -349,6 +503,252 @@ class RoutingTests(unittest.TestCase):
                 call(config, "12345678901234568", "Today's color(s) you follow: Brown."),
             ],
         )
+
+    def test_run_does_not_send_notifications_when_color_cue_is_missing(self) -> None:
+        profiles = (RecipientProfile("Alice", "12345678901234567", ("yellow",)),)
+        config = Config(
+            signalwire_project_id="project",
+            signalwire_api_token="token",
+            signalwire_space_url="space.signalwire.com",
+            signalwire_from_number="+15551230000",
+            discord_bot_token="bot-token",
+            call_to_number="+15551230002",
+            dtmf_digits="1234",
+            whisper_model="base",
+            profiles=profiles,
+            recording_format="test",
+        )
+        error = io.StringIO()
+
+        with (
+            patch("dialer.signalwire_request", return_value={"sid": "call-id"}),
+            patch("dialer.wait_for_call_completion", return_value="completed"),
+            patch("dialer.wait_for_recording", return_value={"uri": "/recording.json"}),
+            patch("dialer.download_recording"),
+            patch("dialer.WhisperTranscriber") as transcriber,
+            patch("dialer.send_discord_dm") as send_dm,
+            redirect_stderr(error),
+        ):
+            transcriber.return_value.transcribe.return_value = "The colors are yellow and blue."
+
+            result = run(config)
+
+        self.assertEqual(result, 1)
+        self.assertIn("no notifications were sent", error.getvalue())
+        send_dm.assert_not_called()
+
+    def test_color_transcription_prompt_includes_profile_colors_and_aliases(self) -> None:
+        config = Config(
+            signalwire_project_id="project",
+            signalwire_api_token="token",
+            signalwire_space_url="space.signalwire.com",
+            signalwire_from_number="+15551230000",
+            discord_bot_token="bot-token",
+            call_to_number="+15551230002",
+            dtmf_digits="1234",
+            whisper_model="base",
+            profiles=(RecipientProfile("Me", "12345678901234567", ("lime", "rose")),),
+            color_aliases=(("line", "lime"), ("rows", "rose")),
+        )
+
+        prompt = color_transcription_prompt(config)
+
+        assert prompt is not None
+        self.assertIn("The groups for today", prompt)
+        self.assertIn("lime, rose, line, rows", prompt)
+
+    def test_whisper_transcriber_passes_initial_prompt_to_model(self) -> None:
+        transcriber = object.__new__(WhisperTranscriber)
+        transcriber._model = Mock()
+        transcriber._model.transcribe.return_value = (
+            [SimpleNamespace(text=" Lime and rose.")],
+            None,
+        )
+
+        transcript = transcriber.transcribe(
+            Path("recording.mp3"),
+            initial_prompt="Possible color names include lime and rose.",
+        )
+        self.assertEqual(transcript, "Lime and rose.")
+        transcriber._model.transcribe.assert_called_once_with(
+            "recording.mp3",
+            beam_size=5,
+            initial_prompt="Possible color names include lime and rose.",
+        )
+
+    def test_google_transcriber_sends_mp3_and_phrase_hints(self) -> None:
+        class RecognitionConfig:
+            class AudioEncoding:
+                MP3 = "MP3"
+
+            def __init__(self, **options: object) -> None:
+                self.options = options
+
+        class SpeechContext:
+            def __init__(self, **options: object) -> None:
+                self.options = options
+
+        class RecognitionAudio:
+            def __init__(self, **options: object) -> None:
+                self.options = options
+
+        client = Mock()
+        client.recognize.return_value.results = [
+            SimpleNamespace(alternatives=[SimpleNamespace(transcript=" Lime was said.")]),
+            SimpleNamespace(alternatives=[]),
+        ]
+        speech = SimpleNamespace(
+            SpeechClient=Mock(return_value=client),
+            RecognitionConfig=RecognitionConfig,
+            SpeechContext=SpeechContext,
+            RecognitionAudio=RecognitionAudio,
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            recording = Path(directory) / "recording.mp3"
+            recording.write_bytes(b"mp3-audio")
+            with patch.object(
+                GoogleSpeechTranscriber,
+                "_load_speech_module",
+                return_value=speech,
+            ):
+                transcript = GoogleSpeechTranscriber("en-US").transcribe(
+                    recording,
+                    speech_hints=["lime"],
+                )
+
+        self.assertEqual(transcript, "Lime was said.")
+        request = client.recognize.call_args.kwargs
+        self.assertEqual(request["audio"].options, {"content": b"mp3-audio"})
+        self.assertEqual(request["config"].options["language_code"], "en-US")
+        self.assertEqual(request["config"].options["encoding"], "MP3")
+        self.assertEqual(
+            request["config"].options["speech_contexts"][0].options["phrases"],
+            ["The groups for today", "lime"],
+        )
+
+    def test_run_uses_google_transcriber_when_selected(self) -> None:
+        profile = RecipientProfile("Alice", "12345678901234567", ("yellow",))
+        config = Config(
+            signalwire_project_id="project",
+            signalwire_api_token="token",
+            signalwire_space_url="space.signalwire.com",
+            signalwire_from_number="+15551230000",
+            discord_bot_token="bot-token",
+            call_to_number="+15551230002",
+            dtmf_digits="1234",
+            whisper_model="base",
+            profiles=(profile,),
+            transcription_provider="google",
+            recording_format="test",
+        )
+
+        with (
+            patch("dialer.signalwire_request", return_value={"sid": "call-id"}),
+            patch("dialer.wait_for_call_completion", return_value="completed"),
+            patch("dialer.wait_for_recording", return_value={"sid": "recording-id"}),
+            patch("dialer.download_recording"),
+            patch("dialer.GoogleSpeechTranscriber") as google_transcriber,
+            patch("dialer.WhisperTranscriber.check_dependency") as check_whisper,
+            patch("dialer.send_discord_dm", return_value="message-id"),
+        ):
+            google_transcriber.return_value.transcribe.return_value = (
+                "The groups for today are yellow."
+            )
+            result = run(config)
+
+        self.assertEqual(result, 0)
+        google_transcriber.check_dependency.assert_called_once_with()
+        google_transcriber.return_value.transcribe.assert_called_once_with(
+            Path("recording.test"),
+            speech_hints=["yellow"],
+        )
+        check_whisper.assert_not_called()
+
+    def test_run_uses_elevenlabs_transcriber_when_selected(self) -> None:
+        profile = RecipientProfile("Alice", "12345678901234567", ("yellow",))
+        config = Config(
+            signalwire_project_id="project",
+            signalwire_api_token="token",
+            signalwire_space_url="space.signalwire.com",
+            signalwire_from_number="+15551230000",
+            discord_bot_token="bot-token",
+            call_to_number="+15551230002",
+            dtmf_digits="1234",
+            whisper_model="base",
+            profiles=(profile,),
+            transcription_provider="elevenlabs",
+            elevenlabs_api_key="elevenlabs-key",
+            elevenlabs_language_code="eng",
+            recording_format="test",
+        )
+
+        with (
+            patch("dialer.signalwire_request", return_value={"sid": "call-id"}),
+            patch("dialer.wait_for_call_completion", return_value="completed"),
+            patch("dialer.wait_for_recording", return_value={"sid": "recording-id"}),
+            patch("dialer.download_recording"),
+            patch("dialer.ElevenLabsSpeechTranscriber") as elevenlabs_transcriber,
+            patch("dialer.AzureSpeechTranscriber.check_dependency") as check_azure,
+            patch("dialer.GoogleSpeechTranscriber.check_dependency") as check_google,
+            patch("dialer.WhisperTranscriber.check_dependency") as check_whisper,
+            patch("dialer.send_discord_dm", return_value="message-id"),
+        ):
+            elevenlabs_transcriber.return_value.transcribe.return_value = (
+                "The groups for today are yellow."
+            )
+            result = run(config)
+
+        self.assertEqual(result, 0)
+        elevenlabs_transcriber.check_dependency.assert_called_once_with("elevenlabs-key")
+        elevenlabs_transcriber.assert_called_once_with("elevenlabs-key", "eng")
+        elevenlabs_transcriber.return_value.transcribe.assert_called_once_with(
+            Path("recording.test")
+        )
+        check_azure.assert_not_called()
+        check_google.assert_not_called()
+        check_whisper.assert_not_called()
+
+    def test_run_uses_azure_transcriber_when_selected(self) -> None:
+        profile = RecipientProfile("Alice", "12345678901234567", ("yellow",))
+        config = Config(
+            signalwire_project_id="project",
+            signalwire_api_token="token",
+            signalwire_space_url="space.signalwire.com",
+            signalwire_from_number="+15551230000",
+            discord_bot_token="bot-token",
+            call_to_number="+15551230002",
+            dtmf_digits="1234",
+            whisper_model="base",
+            profiles=(profile,),
+            transcription_provider="azure",
+            azure_speech_key="azure-key",
+            azure_speech_region="eastus",
+            recording_format="test",
+        )
+
+        with (
+            patch("dialer.signalwire_request", return_value={"sid": "call-id"}),
+            patch("dialer.wait_for_call_completion", return_value="completed"),
+            patch("dialer.wait_for_recording", return_value={"sid": "recording-id"}),
+            patch("dialer.download_recording"),
+            patch("dialer.AzureSpeechTranscriber") as azure_transcriber,
+            patch("dialer.GoogleSpeechTranscriber.check_dependency") as check_google,
+            patch("dialer.WhisperTranscriber.check_dependency") as check_whisper,
+            patch("dialer.send_discord_dm", return_value="message-id"),
+        ):
+            azure_transcriber.return_value.transcribe.return_value = (
+                "The groups for today are yellow."
+            )
+            result = run(config)
+
+        self.assertEqual(result, 0)
+        azure_transcriber.check_dependency.assert_called_once_with("azure-key", "eastus")
+        azure_transcriber.return_value.transcribe.assert_called_once_with(
+            Path("recording.test")
+        )
+        check_google.assert_not_called()
+        check_whisper.assert_not_called()
 
     def test_transcription_test_prints_full_transcript_without_sending_dms(self) -> None:
         config = Config(
@@ -447,6 +847,53 @@ class RoutingTests(unittest.TestCase):
         self.assertIn("The transcript says yellow.", output.getvalue())
         self.assertIn("Color check: 'brown' was not detected.", output.getvalue())
         send_dm.assert_not_called()
+
+    def test_color_list_test_detects_multiple_followed_colors_after_cue_only(self) -> None:
+        profiles = (
+            RecipientProfile("Me", "12345678901234567", ("yellow", "blue", "brown")),
+        )
+        config = Config(
+            signalwire_project_id="project",
+            signalwire_api_token="token",
+            signalwire_space_url="space.signalwire.com",
+            signalwire_from_number="+15551230000",
+            discord_bot_token="",
+            call_to_number="+15551230002",
+            dtmf_digits="1234",
+            whisper_model="base",
+            profiles=profiles,
+            color_aliases=(("frown", "brown"),),
+            recording_format="test",
+        )
+        output = io.StringIO()
+
+        with (
+            patch("dialer.signalwire_request", return_value={"sid": "call-id"}),
+            patch("dialer.wait_for_call_completion", return_value="completed"),
+            patch("dialer.wait_for_recording", return_value={"uri": "/recording.json"}),
+            patch("dialer.download_recording"),
+            patch("dialer.WhisperTranscriber") as transcriber,
+            patch("dialer.send_discord_dm") as send_dm,
+            redirect_stdout(output),
+        ):
+            transcriber.return_value.transcribe.return_value = (
+                "Earlier, red was mentioned. The group's for today: YELLOW, frown, and blue."
+            )
+
+            result = run(config, color_list_test=True)
+
+        self.assertEqual(result, 0)
+        self.assertIn("Colors detected: yellow, blue, brown.", output.getvalue())
+        self.assertNotIn("red", output.getvalue())
+        send_dm.assert_not_called()
+
+    def test_text_after_color_list_cue_handles_punctuation_and_apostrophe_variants(self) -> None:
+        suffix = text_after_color_list_cue(
+            "The groups for today are: Yellow and light blue."
+        )
+
+        self.assertEqual(suffix, "are: Yellow and light blue.")
+        self.assertIsNone(text_after_color_list_cue("No cue phrase was spoken."))
 
     def test_transcription_dm_test_sends_full_transcript_to_only_selected_profile(self) -> None:
         profile = RecipientProfile("Me", "12345678901234567", ("lime",))

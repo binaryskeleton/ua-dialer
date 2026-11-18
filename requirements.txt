@@ -1,5 +1,6 @@
 python-dotenv
 requests
 faster-whisper
+google-cloud-speech
 PyNaCl
 av<19

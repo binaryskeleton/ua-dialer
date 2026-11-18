@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import argparse
+import io
 import json
 import os
 import re
 import sys
 import time
+import wave
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
@@ -19,6 +21,7 @@ from dotenv import load_dotenv
 TERMINAL_CALL_STATUSES = {"completed", "busy", "failed", "no-answer", "canceled"}
 RECORDING_DOWNLOAD_ATTEMPTS = 5
 RECORDING_DOWNLOAD_RETRY_DELAY_SECONDS = 15
+COLOR_LIST_CUE_PHRASE = "The groups for today"
 
 load_dotenv(Path(__file__).with_name(".env"), override=True)
 
@@ -47,6 +50,13 @@ class Config:
     dtmf_digits: str
     whisper_model: str
     profiles: tuple[RecipientProfile, ...]
+    transcription_provider: str = "whisper"
+    google_speech_language_code: str = "en-US"
+    elevenlabs_api_key: str = ""
+    elevenlabs_language_code: str = "eng"
+    azure_speech_key: str = ""
+    azure_speech_region: str = ""
+    azure_speech_language_code: str = "en-US"
     color_aliases: tuple[tuple[str, str], ...] = ()
     poll_interval_seconds: int = 15
     poll_timeout_seconds: int = 1800
@@ -73,10 +83,23 @@ class Config:
             "call_to_number": os.getenv("CALL_TO_NUMBER", ""),
             "dtmf_digits": os.getenv("DTMF_DIGITS", ""),
             "whisper_model": os.getenv("WHISPER_MODEL", "base"),
+            "transcription_provider": os.getenv("TRANSCRIPTION_PROVIDER", "elevenlabs").strip().lower(),
+            "google_speech_language_code": os.getenv("GOOGLE_SPEECH_LANGUAGE_CODE", "en-US").strip(),
+            "elevenlabs_api_key": os.getenv("ELEVENLABS_API_KEY", ""),
+            "elevenlabs_language_code": os.getenv("ELEVENLABS_LANGUAGE_CODE", "eng").strip(),
+            "azure_speech_key": os.getenv("AZURE_SPEECH_KEY", ""),
+            "azure_speech_region": os.getenv("AZURE_SPEECH_REGION", "").strip().lower(),
+            "azure_speech_language_code": os.getenv("AZURE_SPEECH_LANGUAGE_CODE", "en-US").strip(),
         }
         profiles_json = os.getenv("DIALER_PROFILES_JSON", "")
         if overrides:
             values.update({name: value for name, value in overrides.items() if value is not None})
+        values["transcription_provider"] = values["transcription_provider"].strip().lower()
+        values["google_speech_language_code"] = values["google_speech_language_code"].strip()
+        if values["transcription_provider"] not in {"azure", "elevenlabs", "google", "whisper"}:
+            raise ValueError(
+                "TRANSCRIPTION_PROVIDER must be 'elevenlabs', 'azure', 'google', or 'whisper'"
+            )
         if discord_test:
             required = ["discord_bot_token"]
         else:
@@ -131,9 +154,33 @@ class Config:
         if (discord_test or (not dry_run and not transcription_test)) and not profiles:
             raise ValueError("DIALER_PROFILES_JSON must contain at least one recipient profile")
 
-        listen_duration_seconds = _positive_int_from_env("LISTEN_DURATION_SECONDS", 60)
+        default_listen_duration = (
+            55 if values["transcription_provider"] in {"azure", "elevenlabs", "google"} else 60
+        )
+        listen_duration_seconds = _positive_int_from_env(
+            "LISTEN_DURATION_SECONDS",
+            default_listen_duration,
+        )
         if listen_duration_seconds > 400:
             raise ValueError("LISTEN_DURATION_SECONDS must not exceed 600")
+        recording_format = os.getenv("RECORDING_FORMAT", "mp3").strip().lower()
+        if values["transcription_provider"] in {"azure", "google"}:
+            if listen_duration_seconds >= 60:
+                raise ValueError(
+                    f"{values['transcription_provider'].title()} speech recognition requires "
+                    "LISTEN_DURATION_SECONDS to be less than 60"
+                )
+        if values["transcription_provider"] == "google":
+            if recording_format != "mp3":
+                raise ValueError("Google Cloud Speech transcription requires RECORDING_FORMAT=mp3")
+            if not values["google_speech_language_code"]:
+                raise ValueError("GOOGLE_SPEECH_LANGUAGE_CODE must not be empty")
+        if values["transcription_provider"] == "elevenlabs":
+            if not values["elevenlabs_language_code"]:
+                raise ValueError("ELEVENLABS_LANGUAGE_CODE must not be empty")
+        if values["transcription_provider"] == "azure":
+            if not values["azure_speech_language_code"]:
+                raise ValueError("AZURE_SPEECH_LANGUAGE_CODE must not be empty")
         return cls(
             **values,
             profiles=profiles,
@@ -141,7 +188,7 @@ class Config:
             poll_interval_seconds=_positive_int_from_env("POLL_INTERVAL_SECONDS", 15),
             poll_timeout_seconds=_positive_int_from_env("POLL_TIMEOUT_SECONDS", 1800),
             listen_duration_seconds=listen_duration_seconds,
-            recording_format=os.getenv("RECORDING_FORMAT", "mp3"),
+            recording_format=recording_format,
         )
 
 
@@ -295,6 +342,50 @@ def find_detected_colors(
                 detected.append(color)
                 break
     return tuple(detected)
+
+
+def text_after_color_list_cue(transcript: str) -> str | None:
+    cue_tokens = [
+        match.group().casefold().replace("'", "").replace("’", "")
+        for match in re.finditer(r"\w+(?:['’]\w+)?", COLOR_LIST_CUE_PHRASE)
+    ]
+    transcript_matches = list(re.finditer(r"\w+(?:['’]\w+)?", transcript))
+    transcript_tokens = [
+        match.group().casefold().replace("'", "").replace("’", "")
+        for match in transcript_matches
+    ]
+    for start in range(len(transcript_tokens) - len(cue_tokens), -1, -1):
+        if transcript_tokens[start:start + len(cue_tokens)] == cue_tokens:
+            cue_end = transcript_matches[start + len(cue_tokens) - 1].end()
+            return transcript[cue_end:].lstrip(" \t\r\n:,-")
+    return None
+
+
+def color_transcription_prompt(config: Config) -> str | None:
+    color_terms = color_transcription_hints(config)
+    if not color_terms:
+        return None
+    return (
+        "This is a telephone recording. The color list follows the phrase "
+        f"{COLOR_LIST_CUE_PHRASE!r}. A weekday and date may come before the colors. "
+        f"Possible color names include {', '.join(color_terms)}."
+    )
+
+
+def color_transcription_hints(config: Config) -> list[str]:
+    color_terms: list[str] = []
+    seen: set[str] = set()
+    for profile in config.profiles:
+        for color in profile.colors:
+            if color.casefold() not in seen:
+                color_terms.append(color)
+                seen.add(color.casefold())
+    for alias, color in config.color_aliases:
+        for term in (alias, color):
+            if term.casefold() not in seen:
+                color_terms.append(term)
+                seen.add(term.casefold())
+    return color_terms
 
 
 def signalwire_request(config: Config, method: str, resource: str, **kwargs: Any) -> dict[str, Any]:
@@ -475,14 +566,221 @@ def download_recording(recording: Mapping[str, Any], config: Config, destination
 
 
 class WhisperTranscriber:
-    def __init__(self, model_size: str) -> None:
-        from faster_whisper import WhisperModel
+    @staticmethod
+    def _load_model_class() -> Any:
+        try:
+            from faster_whisper import WhisperModel
+        except ModuleNotFoundError as error:
+            if error.name != "faster_whisper":
+                raise
+            raise RuntimeError(
+                "Transcription requires faster-whisper. Install project dependencies "
+                "with `python -m pip install -r requirements.txt` before placing a call."
+            ) from error
+        return WhisperModel
 
-        self._model = WhisperModel(model_size, device="cpu", compute_type="int8")
+    @classmethod
+    def check_dependency(cls) -> None:
+        cls._load_model_class()
+
+    def __init__(self, model_size: str) -> None:
+        model_class = self._load_model_class()
+        self._model = model_class(model_size, device="cpu", compute_type="int8")
+
+    def transcribe(self, audio_path: Path, *, initial_prompt: str | None = None) -> str:
+        options: dict[str, Any] = {"beam_size": 5}
+        if initial_prompt is not None:
+            options["initial_prompt"] = initial_prompt
+        segments, _ = self._model.transcribe(str(audio_path), **options)
+        return " ".join(segment.text.strip() for segment in segments).strip()
+
+
+class GoogleSpeechTranscriber:
+    @staticmethod
+    def _load_speech_module() -> Any:
+        try:
+            from google.cloud import speech
+        except ModuleNotFoundError as error:
+            if error.name not in {"google", "google.cloud"}:
+                raise
+            raise RuntimeError(
+                "Google Cloud Speech requires google-cloud-speech. Install project "
+                "dependencies with `python -m pip install -r requirements.txt`."
+            ) from error
+        return speech
+
+    @classmethod
+    def _create_client(cls) -> tuple[Any, Any]:
+        speech = cls._load_speech_module()
+        from google.auth.exceptions import DefaultCredentialsError
+
+        try:
+            return speech, speech.SpeechClient()
+        except DefaultCredentialsError as error:
+            raise RuntimeError(
+                "Google Cloud credentials are unavailable. Configure "
+                "GOOGLE_APPLICATION_CREDENTIALS or Application Default Credentials "
+                "before placing a call."
+            ) from error
+
+    @classmethod
+    def check_dependency(cls) -> None:
+        cls._create_client()
+
+    def __init__(self, language_code: str) -> None:
+        self._speech, self._client = self._create_client()
+        self._language_code = language_code
+
+    def transcribe(self, audio_path: Path, *, speech_hints: list[str] | None = None) -> str:
+        config_options: dict[str, Any] = {
+            "encoding": self._speech.RecognitionConfig.AudioEncoding.MP3,
+            "language_code": self._language_code,
+            "model": "phone_call",
+            "enable_automatic_punctuation": True,
+        }
+        phrases = [COLOR_LIST_CUE_PHRASE, *(speech_hints or [])]
+        config_options["speech_contexts"] = [
+            self._speech.SpeechContext(phrases=phrases, boost=10.0)
+        ]
+        response = self._client.recognize(
+            config=self._speech.RecognitionConfig(**config_options),
+            audio=self._speech.RecognitionAudio(content=audio_path.read_bytes()),
+        )
+        return " ".join(
+            result.alternatives[0].transcript.strip()
+            for result in response.results
+            if result.alternatives
+        ).strip()
+
+
+class ElevenLabsSpeechTranscriber:
+    MODEL_ID = "scribe_v3"
+
+    @staticmethod
+    def check_dependency(api_key: str) -> None:
+        if not api_key.strip():
+            raise ValueError("ELEVENLABS_API_KEY is required for ElevenLabs transcription")
+
+    def __init__(self, api_key: str, language_code: str) -> None:
+        self._api_key = api_key
+        self._language_code = language_code
 
     def transcribe(self, audio_path: Path) -> str:
-        segments, _ = self._model.transcribe(str(audio_path), beam_size=5)
-        return " ".join(segment.text.strip() for segment in segments).strip()
+        import requests
+
+        try:
+            with audio_path.open("rb") as audio_file:
+                response = requests.post(
+                    "https://api.elevenlabs.io/v1/speech-to-text",
+                    headers={"xi-api-key": self._api_key},
+                    data={
+                        "model_id": self.MODEL_ID,
+                        "language_code": self._language_code,
+                    },
+                    files={"file": (audio_path.name, audio_file)},
+                    timeout=60,
+                )
+        except requests.RequestException as error:
+            raise RuntimeError("ElevenLabs Speech-to-Text request failed") from error
+        if not response.ok:
+            raise RuntimeError(
+                f"ElevenLabs Speech-to-Text failed with HTTP {response.status_code}: "
+                f"{response.text[:1000]}"
+            )
+        try:
+            result = response.json()
+        except ValueError as error:
+            raise RuntimeError("ElevenLabs returned invalid JSON") from error
+        if not isinstance(result, dict) or not isinstance(result.get("text"), str):
+            raise RuntimeError("ElevenLabs returned an invalid transcription response")
+        return result["text"].strip()
+
+
+def recording_to_pcm_wav(audio_path: Path) -> bytes:
+    import av
+
+    output = io.BytesIO()
+    with av.open(str(audio_path)) as container:
+        if not container.streams.audio:
+            raise RuntimeError("The SignalWire recording contains no audio stream")
+        resampler = av.AudioResampler(format="s16", layout="mono", rate=16000)
+        with wave.open(output, "wb") as wav_file:
+            wav_file.setnchannels(1)
+            wav_file.setsampwidth(2)
+            wav_file.setframerate(16000)
+            for frame in container.decode(audio=0):
+                for resampled_frame in resampler.resample(frame):
+                    wav_file.writeframes(resampled_frame.to_ndarray().tobytes())
+            for resampled_frame in resampler.resample(None):
+                wav_file.writeframes(resampled_frame.to_ndarray().tobytes())
+    return output.getvalue()
+
+
+class AzureSpeechTranscriber:
+    def __init__(self, key: str, region: str, language_code: str) -> None:
+        self._key = key
+        self._region = region
+        self._language_code = language_code
+
+    @staticmethod
+    def check_dependency(key: str, region: str) -> None:
+        if not key:
+            raise ValueError("AZURE_SPEECH_KEY is required for Azure transcription")
+        if not re.fullmatch(r"[a-z0-9-]+", region):
+            raise ValueError(
+                "AZURE_SPEECH_REGION must be an Azure region name such as 'eastus'"
+            )
+        try:
+            import av
+        except ModuleNotFoundError as error:
+            if error.name != "av":
+                raise
+            raise RuntimeError(
+                "Azure audio conversion requires PyAV. Install project dependencies "
+                "with `python -m pip install -r requirements.txt`."
+            ) from error
+        av.AudioResampler(format="s16", layout="mono", rate=16000)
+
+    def transcribe(self, audio_path: Path) -> str:
+        import requests
+
+        url = (
+            f"https://{self._region}.stt.speech.microsoft.com/"
+            "speech/recognition/conversation/cognitiveservices/v1"
+        )
+        try:
+            response = requests.post(
+                url,
+                params={"language": self._language_code, "format": "simple"},
+                headers={
+                    "Ocp-Apim-Subscription-Key": self._key,
+                    "Content-Type": "audio/wav",
+                },
+                data=recording_to_pcm_wav(audio_path),
+                timeout=60,
+            )
+        except requests.RequestException as error:
+            raise RuntimeError("Azure Speech transcription request failed") from error
+        if not response.ok:
+            raise RuntimeError(
+                f"Azure Speech transcription failed with HTTP {response.status_code}: "
+                f"{response.text[:1000]}"
+            )
+        try:
+            result = response.json()
+        except ValueError as error:
+            raise RuntimeError("Azure Speech returned invalid JSON") from error
+        if not isinstance(result, dict):
+            raise RuntimeError("Azure Speech returned an invalid response")
+        status = result.get("RecognitionStatus")
+        if status == "NoMatch":
+            return ""
+        if status != "Success" or not isinstance(result.get("DisplayText"), str):
+            raise RuntimeError(
+                f"Azure Speech did not transcribe the recording: "
+                f"{result.get('RecognitionStatus', 'unknown status')}"
+            )
+        return result["DisplayText"].strip()
 
 
 def run(
@@ -493,14 +791,23 @@ def run(
     transcription_test: bool = False,
     transcription_dm_test: bool = False,
     color_test: str | None = None,
+    color_list_test: bool = False,
 ) -> int:
     if transcription_test and transcription_dm_test:
         raise ValueError("Choose either local transcription output or Discord transcription DM")
+    if color_list_test and (
+        dry_run
+        or discord_test
+        or transcription_test
+        or transcription_dm_test
+        or color_test is not None
+    ):
+        raise ValueError("A color-list test cannot be combined with other run modes")
     if color_test is not None:
         color_test = " ".join(color_test.split())
         if not color_test:
             raise ValueError("A color is required for a color test")
-        if dry_run or discord_test or transcription_dm_test:
+        if dry_run or discord_test or transcription_dm_test or color_list_test:
             raise ValueError("A color test cannot be combined with other run modes")
     if transcription_dm_test:
         if not config.discord_bot_token:
@@ -526,6 +833,18 @@ def run(
         print(f"Listening window: {config.listen_duration_seconds} seconds")
         print(f"Call flow generated: {'yes' if bool(twiml) else 'no'}")
         return 0
+
+    if config.transcription_provider == "elevenlabs":
+        ElevenLabsSpeechTranscriber.check_dependency(config.elevenlabs_api_key)
+    elif config.transcription_provider == "google":
+        GoogleSpeechTranscriber.check_dependency()
+    elif config.transcription_provider == "azure":
+        AzureSpeechTranscriber.check_dependency(
+            config.azure_speech_key,
+            config.azure_speech_region,
+        )
+    else:
+        WhisperTranscriber.check_dependency()
 
     call = signalwire_request(
         config,
@@ -564,17 +883,56 @@ def run(
     recording_path = Path(f"recording.{config.recording_format}")
     try:
         download_recording(recording, config, recording_path)
-        transcript = WhisperTranscriber(config.whisper_model).transcribe(recording_path)
+        if config.transcription_provider == "elevenlabs":
+            transcript = ElevenLabsSpeechTranscriber(
+                config.elevenlabs_api_key,
+                config.elevenlabs_language_code,
+            ).transcribe(recording_path)
+        elif config.transcription_provider == "google":
+            transcript = GoogleSpeechTranscriber(config.google_speech_language_code).transcribe(
+                recording_path,
+                speech_hints=color_transcription_hints(config),
+            )
+        elif config.transcription_provider == "azure":
+            transcript = AzureSpeechTranscriber(
+                config.azure_speech_key,
+                config.azure_speech_region,
+                config.azure_speech_language_code,
+            ).transcribe(recording_path)
+        else:
+            transcript = WhisperTranscriber(config.whisper_model).transcribe(
+                recording_path,
+                initial_prompt=color_transcription_prompt(config),
+            )
     finally:
         recording_path.unlink(missing_ok=True)
 
-    if transcription_test or transcription_dm_test or color_test is not None:
-        print("Full transcript:")
-        print(transcript if transcript else "(No speech was transcribed.)")
+    if transcription_test or transcription_dm_test or color_test is not None or color_list_test:
+        if not color_list_test:
+            print("Full transcript:")
+            print(transcript if transcript else "(No speech was transcribed.)")
         if color_test is not None:
             detected = find_detected_colors(transcript, (color_test,))
             result = "was detected" if detected else "was not detected"
             print(f"Color check: {color_test!r} {result}.")
+        if color_list_test:
+            transcript_suffix = text_after_color_list_cue(transcript)
+            if transcript_suffix is None:
+                print(f"Color cue phrase {COLOR_LIST_CUE_PHRASE!r} was not found.")
+            else:
+                colors_by_key: dict[str, str] = {}
+                for profile in config.profiles:
+                    for color in profile.colors:
+                        colors_by_key.setdefault(color.casefold(), color)
+                detected = find_detected_colors(
+                    transcript_suffix,
+                    tuple(colors_by_key.values()),
+                    config.color_aliases,
+                )
+                if detected:
+                    print(f"Colors detected: {', '.join(detected)}.")
+                else:
+                    print("No followed colors were detected after the cue phrase.")
         if transcription_dm_test:
             profile = config.profiles[0]
             message_count = send_transcription_dm(config, profile, transcript)
@@ -584,9 +942,32 @@ def run(
             )
         return 0
 
+    print("Configured profile colors:")
+    for profile in config.profiles:
+        print(f"  {profile.name}: {', '.join(profile.colors)}")
+    if config.color_aliases:
+        aliases = ", ".join(
+            f"{alias.casefold()} -> {color.casefold()}"
+            for alias, color in config.color_aliases
+        )
+        print(f"Configured color aliases: {aliases}")
+
+    transcript_suffix = text_after_color_list_cue(transcript)
+    if transcript_suffix is None:
+        print(
+            f"Color cue phrase {COLOR_LIST_CUE_PHRASE!r} was not found; "
+            "no notifications were sent.",
+            file=sys.stderr,
+        )
+        return 1
+
     notification_count = 0
     for profile in config.profiles:
-        matched_colors = find_detected_colors(transcript, profile.colors, config.color_aliases)
+        matched_colors = find_detected_colors(
+            transcript_suffix,
+            profile.colors,
+            config.color_aliases,
+        )
         if not matched_colors:
             message = "Your color was not called."
         else:
