@@ -2,17 +2,20 @@ import json
 import tempfile
 import unittest
 from base64 import b64decode, b64encode
+from dataclasses import replace
 from pathlib import Path
 from unittest.mock import Mock, patch
 
-from dialer import RecipientProfile, parse_profile_configuration
+from dialer import Config, RecipientProfile, parse_profile_configuration
 from manage_profiles import (
     GITHUB_REPOSITORY,
     GITHUB_SECRET_NAME,
+    ProfileConfiguration,
     load_profiles,
     load_profile_configuration,
     profiles_json,
     run_manager,
+    run_color_list_test,
     run_color_test,
     run_transcription_test_dm,
     save_profiles,
@@ -128,7 +131,7 @@ class ProfileManagerTests(unittest.TestCase):
                     "1",
                     "1",
                     "4",
-                    "9",
+                    "10",
                 ]
             )
             output: list[str] = []
@@ -153,7 +156,7 @@ class ProfileManagerTests(unittest.TestCase):
     def test_invalid_profile_is_not_saved(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "profiles.json"
-            answers = iter(["2", "Alice", "not-a-discord-id", "yellow", "9"])
+            answers = iter(["2", "Alice", "not-a-discord-id", "yellow", "10"])
             output: list[str] = []
 
             result = run_manager(
@@ -171,7 +174,7 @@ class ProfileManagerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "profiles.json"
             save_profiles(path, profiles)
-            answers = iter(["5", "yes", "9"])
+            answers = iter(["5", "yes", "10"])
             output: list[str] = []
 
             with patch("manage_profiles.upload_profiles_to_github") as upload:
@@ -195,7 +198,7 @@ class ProfileManagerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "profiles.json"
             save_profiles(path, profiles)
-            answers = iter(["6", "1", "yes", "9"])
+            answers = iter(["6", "1", "yes", "10"])
             output: list[str] = []
 
             with patch("manage_profiles.run_transcription_test_dm", return_value=0) as run_test:
@@ -215,9 +218,46 @@ class ProfileManagerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "profiles.json"
             save_profiles(path, (profile,))
-            answers = iter(["6", "1", "no", "9"])
+            answers = iter(["6", "1", "no", "10"])
 
             with patch("manage_profiles.run_transcription_test_dm") as run_test:
+                result = run_manager(
+                    path,
+                    input_fn=lambda _prompt: next(answers),
+                    output_fn=lambda _line: None,
+                )
+
+        self.assertEqual(result, 0)
+        run_test.assert_not_called()
+
+    def test_color_list_menu_confirms_and_sends_list_to_selected_profile(self) -> None:
+        profiles = (RecipientProfile("Me", "12345678901234567", ("yellow", "blue")),)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "profiles.json"
+            save_profiles(path, profiles)
+            answers = iter(["8", "1", "yes", "10"])
+            output: list[str] = []
+
+            with patch("manage_profiles.run_color_list_test", return_value=0) as run_test:
+                result = run_manager(
+                    path,
+                    input_fn=lambda _prompt: next(answers),
+                    output_fn=output.append,
+                )
+
+        self.assertEqual(result, 0)
+        run_test.assert_called_once_with(ProfileConfiguration(profiles), profiles[0])
+        self.assertTrue(any("The groups for today" in line for line in output))
+        self.assertTrue(any("Color-list test completed for Me" in line for line in output))
+
+    def test_color_list_menu_cancel_does_not_place_call(self) -> None:
+        profile = RecipientProfile("Me", "12345678901234567", ("yellow",))
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "profiles.json"
+            save_profiles(path, (profile,))
+            answers = iter(["8", "", "10"])
+
+            with patch("manage_profiles.run_color_list_test") as run_test:
                 result = run_manager(
                     path,
                     input_fn=lambda _prompt: next(answers),
@@ -230,7 +270,7 @@ class ProfileManagerTests(unittest.TestCase):
     def test_color_test_menu_prompts_and_calls_only_after_confirmation(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "profiles.json"
-            answers = iter(["7", "brown", "yes", "9"])
+            answers = iter(["7", "brown", "yes", "10"])
             output: list[str] = []
 
             with patch("manage_profiles.run_color_test", return_value=0) as run_test:
@@ -248,7 +288,7 @@ class ProfileManagerTests(unittest.TestCase):
     def test_color_test_cancel_does_not_place_call(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "profiles.json"
-            answers = iter(["7", "brown", "no", "9"])
+            answers = iter(["7", "brown", "no", "10"])
 
             with patch("manage_profiles.run_color_test") as run_test:
                 result = run_manager(
@@ -268,7 +308,7 @@ class ProfileManagerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "profiles.json"
             save_profiles(path, profiles)
-            answers = iter(["8", "frown", "brown", "9"])
+            answers = iter(["9", "frown", "brown", "10"])
             output: list[str] = []
 
             result = run_manager(
@@ -308,6 +348,33 @@ class ProfileManagerTests(unittest.TestCase):
                 run_color_test("   ")
 
         from_env.assert_not_called()
+
+    def test_color_list_test_runner_uses_saved_profiles_and_aliases(self) -> None:
+        profiles = (RecipientProfile("Me", "12345678901234567", ("brown",)),)
+        aliases = (("frown", "brown"),)
+        profile_configuration = ProfileConfiguration(profiles, aliases)
+        recipient = profiles[0]
+        config = Config.from_environment(
+            dry_run=True,
+            overrides={"call_to_number": "+15551230002", "dtmf_digits": "1234"},
+        )
+        with (
+            patch("manage_profiles.Config.from_environment", return_value=config) as from_env,
+            patch("manage_profiles.run", return_value=0) as dialer_run,
+        ):
+            result = run_color_list_test(profile_configuration, recipient)
+
+        self.assertEqual(result, 0)
+        from_env.assert_called_once_with(
+            transcription_test=True,
+            profiles_override=profiles,
+        )
+        self.assertEqual(dialer_run.call_args.args[0].color_aliases, aliases)
+        dialer_run.assert_called_once_with(
+            replace(config, color_aliases=aliases),
+            color_list_test=True,
+            color_list_recipient=recipient,
+        )
 
     def test_transcription_test_runner_uses_only_selected_profile(self) -> None:
         profile = RecipientProfile("Me", "12345678901234567", ("lime",))

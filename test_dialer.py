@@ -379,6 +379,38 @@ class ElevenLabsSpeechTests(unittest.TestCase):
         )
         self.assertEqual(post.call_args.kwargs["timeout"], 60)
 
+    def test_transcriber_retries_rate_limit_using_retry_after_and_reopens_file(self) -> None:
+        busy_response = Mock(
+            ok=False,
+            status_code=429,
+            headers={"Retry-After": "1.5"},
+        )
+        response = Mock(ok=True, status_code=200)
+        response.json.return_value = {"text": "The groups for today are yellow."}
+        uploaded_audio: list[bytes] = []
+
+        def capture_request(_url: str, **kwargs: object) -> Mock:
+            uploaded_audio.append(kwargs["files"]["file"][1].read())
+            return (busy_response, response)[len(uploaded_audio) - 1]
+
+        with tempfile.TemporaryDirectory() as directory:
+            audio_path = Path(directory) / "recording.mp3"
+            audio_path.write_bytes(b"mp3-audio")
+
+            with (
+                patch("requests.post", side_effect=capture_request) as post,
+                patch("dialer.time.sleep") as sleep,
+            ):
+                transcript = ElevenLabsSpeechTranscriber(
+                    "elevenlabs-key",
+                    "eng",
+                ).transcribe(audio_path)
+
+        self.assertEqual(transcript, "The groups for today are yellow.")
+        self.assertEqual(post.call_count, 2)
+        self.assertEqual(uploaded_audio, [b"mp3-audio", b"mp3-audio"])
+        sleep.assert_called_once_with(1.5)
+
 
 class RoutingTests(unittest.TestCase):
     def test_missing_transcription_dependency_fails_before_placing_call(self) -> None:
@@ -848,7 +880,7 @@ class RoutingTests(unittest.TestCase):
         self.assertIn("Color check: 'brown' was not detected.", output.getvalue())
         send_dm.assert_not_called()
 
-    def test_color_list_test_detects_multiple_followed_colors_after_cue_only(self) -> None:
+    def test_color_list_test_sends_full_spoken_list_after_cue(self) -> None:
         profiles = (
             RecipientProfile("Me", "12345678901234567", ("yellow", "blue", "brown")),
         )
@@ -857,7 +889,7 @@ class RoutingTests(unittest.TestCase):
             signalwire_api_token="token",
             signalwire_space_url="space.signalwire.com",
             signalwire_from_number="+15551230000",
-            discord_bot_token="",
+            discord_bot_token="bot-token",
             call_to_number="+15551230002",
             dtmf_digits="1234",
             whisper_model="base",
@@ -873,19 +905,31 @@ class RoutingTests(unittest.TestCase):
             patch("dialer.wait_for_recording", return_value={"uri": "/recording.json"}),
             patch("dialer.download_recording"),
             patch("dialer.WhisperTranscriber") as transcriber,
-            patch("dialer.send_discord_dm") as send_dm,
+            patch("dialer.send_discord_dm", return_value="message-id") as send_dm,
             redirect_stdout(output),
         ):
             transcriber.return_value.transcribe.return_value = (
-                "Earlier, red was mentioned. The group's for today: YELLOW, frown, and blue."
+                "Earlier, red was mentioned. The group's for today: "
+                "YELLOW, frown, blue, and purple."
             )
 
-            result = run(config, color_list_test=True)
+            result = run(
+                config,
+                color_list_test=True,
+                color_list_recipient=profiles[0],
+            )
 
         self.assertEqual(result, 0)
-        self.assertIn("Colors detected: yellow, blue, brown.", output.getvalue())
-        self.assertNotIn("red", output.getvalue())
-        send_dm.assert_not_called()
+        self.assertIn(
+            "Full color list after cue: YELLOW, frown, blue, and purple.",
+            output.getvalue(),
+        )
+        self.assertIn("Full color list sent to Me", output.getvalue())
+        self.assertNotIn("red", send_dm.call_args.args[2])
+        self.assertIn("purple", send_dm.call_args.args[2])
+        self.assertEqual(send_dm.call_args.args[1], "12345678901234567")
+        prompt = transcriber.return_value.transcribe.call_args.kwargs["initial_prompt"]
+        self.assertIn("including colors not configured for any profile", prompt)
 
     def test_text_after_color_list_cue_handles_punctuation_and_apostrophe_variants(self) -> None:
         suffix = text_after_color_list_cue(

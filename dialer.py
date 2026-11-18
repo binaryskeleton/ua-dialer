@@ -22,6 +22,9 @@ TERMINAL_CALL_STATUSES = {"completed", "busy", "failed", "no-answer", "canceled"
 RECORDING_DOWNLOAD_ATTEMPTS = 5
 RECORDING_DOWNLOAD_RETRY_DELAY_SECONDS = 15
 COLOR_LIST_CUE_PHRASE = "The groups for today"
+ELEVENLABS_MAX_ATTEMPTS = 4
+ELEVENLABS_RETRY_BASE_SECONDS = 2
+ELEVENLABS_MAX_RETRY_DELAY_SECONDS = 30
 
 load_dotenv(Path(__file__).with_name(".env"), override=True)
 
@@ -372,6 +375,14 @@ def color_transcription_prompt(config: Config) -> str | None:
     )
 
 
+def color_list_transcription_prompt() -> str:
+    return (
+        "This is a telephone recording. Transcribe the full list of colors spoken after "
+        f"{COLOR_LIST_CUE_PHRASE!r}, including colors not configured for any profile. "
+        "A weekday or date may come before the colors."
+    )
+
+
 def color_transcription_hints(config: Config) -> list[str]:
     color_terms: list[str] = []
     seen: set[str] = set()
@@ -470,7 +481,13 @@ def send_discord_dm(config: Config, user_id: str, message: str) -> str:
     return str(message_id)
 
 
-def send_transcription_dm(config: Config, profile: RecipientProfile, transcript: str) -> int:
+def send_transcription_dm(
+    config: Config,
+    profile: RecipientProfile,
+    transcript: str,
+    *,
+    label: str = "Transcription test",
+) -> int:
     content = transcript or "(No speech was transcribed.)"
     chunks: list[str] = []
     start = 0
@@ -484,7 +501,7 @@ def send_transcription_dm(config: Config, profile: RecipientProfile, transcript:
         start = end
 
     for index, chunk in enumerate(chunks, start=1):
-        message = f"Transcription test ({index}/{len(chunks)}):\n{chunk}"
+        message = f"{label} ({index}/{len(chunks)}):\n{chunk}"
         send_discord_dm(config, profile.discord_user_id, message)
     return len(chunks)
 
@@ -668,20 +685,36 @@ class ElevenLabsSpeechTranscriber:
     def transcribe(self, audio_path: Path) -> str:
         import requests
 
-        try:
-            with audio_path.open("rb") as audio_file:
-                response = requests.post(
-                    "https://api.elevenlabs.io/v1/speech-to-text",
-                    headers={"xi-api-key": self._api_key},
-                    data={
-                        "model_id": self.MODEL_ID,
-                        "language_code": self._language_code,
-                    },
-                    files={"file": (audio_path.name, audio_file)},
-                    timeout=60,
+        for attempt in range(ELEVENLABS_MAX_ATTEMPTS):
+            try:
+                with audio_path.open("rb") as audio_file:
+                    response = requests.post(
+                        "https://api.elevenlabs.io/v1/speech-to-text",
+                        headers={"xi-api-key": self._api_key},
+                        data={
+                            "model_id": self.MODEL_ID,
+                            "language_code": self._language_code,
+                        },
+                        files={"file": (audio_path.name, audio_file)},
+                        timeout=60,
+                    )
+            except requests.RequestException as error:
+                raise RuntimeError("ElevenLabs Speech-to-Text request failed") from error
+            if (
+                response.status_code != 429
+                or attempt == ELEVENLABS_MAX_ATTEMPTS - 1
+            ):
+                break
+
+            retry_after = response.headers.get("Retry-After")
+            try:
+                delay = float(retry_after) if retry_after else (
+                    ELEVENLABS_RETRY_BASE_SECONDS ** (attempt + 1)
                 )
-        except requests.RequestException as error:
-            raise RuntimeError("ElevenLabs Speech-to-Text request failed") from error
+            except ValueError:
+                delay = ELEVENLABS_RETRY_BASE_SECONDS ** (attempt + 1)
+            time.sleep(min(max(delay, 0), ELEVENLABS_MAX_RETRY_DELAY_SECONDS))
+
         if not response.ok:
             raise RuntimeError(
                 f"ElevenLabs Speech-to-Text failed with HTTP {response.status_code}: "
@@ -792,6 +825,7 @@ def run(
     transcription_dm_test: bool = False,
     color_test: str | None = None,
     color_list_test: bool = False,
+    color_list_recipient: RecipientProfile | None = None,
 ) -> int:
     if transcription_test and transcription_dm_test:
         raise ValueError("Choose either local transcription output or Discord transcription DM")
@@ -803,6 +837,10 @@ def run(
         or color_test is not None
     ):
         raise ValueError("A color-list test cannot be combined with other run modes")
+    if color_list_recipient is not None and not color_list_test:
+        raise ValueError("A color-list recipient can only be used with a color-list test")
+    if color_list_recipient is not None and not config.discord_bot_token:
+        raise ValueError("DISCORD_BOT_TOKEN is required to send the color list by Discord DM")
     if color_test is not None:
         color_test = " ".join(color_test.split())
         if not color_test:
@@ -891,7 +929,9 @@ def run(
         elif config.transcription_provider == "google":
             transcript = GoogleSpeechTranscriber(config.google_speech_language_code).transcribe(
                 recording_path,
-                speech_hints=color_transcription_hints(config),
+                speech_hints=(
+                    [] if color_list_test else color_transcription_hints(config)
+                ),
             )
         elif config.transcription_provider == "azure":
             transcript = AzureSpeechTranscriber(
@@ -902,7 +942,11 @@ def run(
         else:
             transcript = WhisperTranscriber(config.whisper_model).transcribe(
                 recording_path,
-                initial_prompt=color_transcription_prompt(config),
+                initial_prompt=(
+                    color_list_transcription_prompt()
+                    if color_list_test
+                    else color_transcription_prompt(config)
+                ),
             )
     finally:
         recording_path.unlink(missing_ok=True)
@@ -919,20 +963,22 @@ def run(
             transcript_suffix = text_after_color_list_cue(transcript)
             if transcript_suffix is None:
                 print(f"Color cue phrase {COLOR_LIST_CUE_PHRASE!r} was not found.")
-            else:
-                colors_by_key: dict[str, str] = {}
-                for profile in config.profiles:
-                    for color in profile.colors:
-                        colors_by_key.setdefault(color.casefold(), color)
-                detected = find_detected_colors(
+                return 1
+            if not transcript_suffix.strip():
+                print("No color list was transcribed after the cue phrase.")
+                return 1
+            print(f"Full color list after cue: {transcript_suffix}")
+            if color_list_recipient is not None:
+                message_count = send_transcription_dm(
+                    config,
+                    color_list_recipient,
                     transcript_suffix,
-                    tuple(colors_by_key.values()),
-                    config.color_aliases,
+                    label="Color list",
                 )
-                if detected:
-                    print(f"Colors detected: {', '.join(detected)}.")
-                else:
-                    print("No followed colors were detected after the cue phrase.")
+                print(
+                    f"Full color list sent to {color_list_recipient.name} in "
+                    f"{message_count} Discord message(s)."
+                )
         if transcription_dm_test:
             profile = config.profiles[0]
             message_count = send_transcription_dm(config, profile, transcript)

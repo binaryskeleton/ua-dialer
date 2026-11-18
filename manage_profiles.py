@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import sys
 from base64 import b64decode, b64encode
+from dataclasses import replace
 from getpass import getpass
 from pathlib import Path
 from typing import Callable
@@ -13,6 +14,7 @@ import requests
 from nacl.public import PublicKey, SealedBox
 
 from dialer import (
+    COLOR_LIST_CUE_PHRASE,
     Config,
     ProfileConfiguration,
     RecipientProfile,
@@ -42,6 +44,22 @@ def run_color_test(color: str) -> int:
         profiles_override=(),
     )
     return run(config, transcription_test=True, color_test=normalized_color)
+
+
+def run_color_list_test(
+    profile_configuration: ProfileConfiguration,
+    recipient: RecipientProfile,
+) -> int:
+    config = Config.from_environment(
+        transcription_test=True,
+        profiles_override=profile_configuration.profiles,
+    )
+    config = replace(config, color_aliases=profile_configuration.color_aliases)
+    return run(
+        config,
+        color_list_test=True,
+        color_list_recipient=recipient,
+    )
 
 
 def load_profiles(path: Path = PROFILES_FILE) -> tuple[RecipientProfile, ...]:
@@ -192,6 +210,9 @@ def run_manager(
     token_prompt: Callable[[str], str] | None = None,
     transcription_test_runner: Callable[[RecipientProfile], int] | None = None,
     color_test_runner: Callable[[str], int] | None = None,
+    color_list_test_runner: (
+        Callable[[ProfileConfiguration, RecipientProfile], int] | None
+    ) = None,
 ) -> int:
     read_input = input if input_fn is None else input_fn
     read_token = getpass if token_prompt is None else token_prompt
@@ -201,6 +222,11 @@ def run_manager(
         else transcription_test_runner
     )
     run_color_check = run_color_test if color_test_runner is None else color_test_runner
+    run_color_list = (
+        run_color_list_test
+        if color_list_test_runner is None
+        else color_list_test_runner
+    )
     try:
         profile_configuration = load_profile_configuration(path)
     except (OSError, ValueError) as exc:
@@ -218,8 +244,9 @@ def run_manager(
         output_fn("5. Upload profiles to GitHub")
         output_fn("6. Call and DM transcript (real call)")
         output_fn("7. Call and check a color (real call)")
-        output_fn("8. Add or update a global color alias")
-        output_fn("9. Exit")
+        output_fn("8. Call and DM the full color list (real call)")
+        output_fn("9. Add or update a global color alias")
+        output_fn("10. Exit")
         choice = read_input("Choose an option: ").strip()
 
         if choice == "1":
@@ -363,6 +390,45 @@ def run_manager(
                     output_fn(f"Color test failed with exit code {result}.")
         elif choice == "8":
             if not profiles:
+                output_fn("Add a user profile before running this test.")
+                continue
+            _show_profiles(profiles, output_fn)
+            selection = read_input(
+                "Enter the profile number to receive the color list, or press Enter to cancel: "
+            ).strip()
+            if not selection:
+                output_fn("Color-list test canceled.")
+                continue
+            try:
+                index = int(selection)
+                if not 1 <= index <= len(profiles):
+                    raise ValueError("Choose a number from the list.")
+            except ValueError as exc:
+                output_fn(f"Invalid profile selection: {exc}")
+                continue
+            recipient = profiles[index - 1]
+            output_fn(
+                f"This places a real SignalWire call and sends the full color list after "
+                f"{COLOR_LIST_CUE_PHRASE!r} to {recipient.name} by Discord DM. "
+                "Call charges may apply."
+            )
+            if read_input("Type yes to place the call: ").strip().casefold() != "yes":
+                output_fn("Color-list test canceled.")
+                continue
+            try:
+                result = run_color_list(
+                    ProfileConfiguration(profiles, color_aliases),
+                    recipient,
+                )
+            except (OSError, RuntimeError, TimeoutError, ValueError, requests.RequestException) as exc:
+                output_fn(f"Color-list test failed: {exc}")
+            else:
+                if result == 0:
+                    output_fn(f"Color-list test completed for {recipient.name}.")
+                else:
+                    output_fn(f"Color-list test failed with exit code {result}.")
+        elif choice == "9":
+            if not profiles:
                 output_fn("Add a user before configuring global color aliases.")
                 continue
             _show_color_aliases(color_aliases, output_fn)
@@ -390,11 +456,11 @@ def run_manager(
             else:
                 color_aliases = updated_configuration.color_aliases
                 output_fn(f"Saved global alias {alias!r} for {color!r} across all profiles.")
-        elif choice == "9":
+        elif choice == "10":
             output_fn(f"Saved user list: {path}")
             return 0
         else:
-            output_fn("Enter a number from 1 to 9.")
+            output_fn("Enter a number from 1 to 10.")
 
 
 if __name__ == "__main__":
